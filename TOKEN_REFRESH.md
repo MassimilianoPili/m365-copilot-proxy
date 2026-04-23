@@ -71,7 +71,7 @@ Then a script connects to `http://localhost:9222` and executes JS in the Copilot
 
 ## Option D — Admin consent (cleanest long-term fix)
 
-Ask the ALTEN IT admin to either:
+Ask the IT admin to either:
 1. Register a new Entra app and grant delegated Graph permissions (original approach), or
 2. Grant admin consent for the `Microsoft Graph Command Line Tools` app (`14d82eec-...`)
 
