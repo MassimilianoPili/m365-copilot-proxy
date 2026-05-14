@@ -1,141 +1,72 @@
 # Microsoft 365 Copilot OpenAI Proxy
 
-A local proxy server that exposes your company's Microsoft 365 Copilot as an OpenAI-compatible API. No Azure app registration or admin consent required.
+Use Microsoft 365 Copilot through OpenAI-compatible clients, local scripts, and coding tools.
 
-## How it works
+This project runs a local FastAPI proxy that talks to the same `substrate.office.com` WebSocket API used by the M365 Copilot web UI, then exposes it as OpenAI-style HTTP endpoints.
 
-The proxy connects to `substrate.office.com`, the same WebSocket API the M365 Copilot web UI uses, and wraps it in OpenAI-compatible HTTP endpoints. Authentication uses a short-lived token extracted from your signed-in browser session.
+No Azure app registration. No admin consent. Sign in with your normal M365 Copilot browser session.
 
-## Endpoints
+## Why Use This
 
-- `GET /healthz` - service health plus token validity and remaining lifetime
-- `GET /v1/token/status` - token validity, expiry time, and seconds remaining
-- `GET /v1/models`
-- `POST /v1/chat/completions` - OpenAI Chat Completions, streaming supported
-- `POST /v1/responses` - OpenAI Responses API, streaming supported
-- `POST /v1/messages` - Anthropic Messages API
+- Use M365 Copilot from OpenAI-compatible clients
+- Works with your existing signed-in Copilot web session
+- Runs locally on `127.0.0.1` by default
+- Auto-captures and refreshes the short-lived browser token
+- Supports persistent Copilot sessions across turns
+- Supports OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages style requests
 
-## Constraints
-
-- The M365 token usually expires in about 1 hour. The server can refresh it from a dedicated signed-in Edge window.
-- Persistent Copilot sessions are supported when the client sends `X-M365-Session-Id` or uses the `m365-copilot:persist` model suffix.
-- System prompts and conversation history are folded into the message as plain text.
-- Tool calls and token usage are not supported.
-- **Claude Code:** Agentic features such as file reading, bash, and code editing require tool use, which this proxy does not support. Use the proxy for general Q&A only; keep Claude Code on the real Anthropic API for coding tasks.
-
----
-
-## Setup
-
-### 1. Install
+## Quick Start
 
 ```powershell
 uv sync
-```
-
-### 2. Start the server
-
-```powershell
 uv run copilot-openai-proxy serve
 ```
 
-The server runs at `http://127.0.0.1:8000` by default.
+The server starts at:
 
-On first run, `serve` opens a dedicated Edge profile at:
+```text
+http://127.0.0.1:8000
+```
+
+On first run, the proxy opens a dedicated Edge window. Sign in to M365 Copilot there once. The proxy will capture the required Substrate token and write it to `.env`.
+
+The dedicated Edge profile is stored at:
 
 ```text
 %USERPROFILE%\.m365-copilot-openai-proxy\edge-profile
 ```
 
-Sign in to M365 Copilot in that Edge window once. The server then tries to capture and save the Substrate token into `.env` automatically.
+If startup says it is waiting for a token, click the Copilot message box and type one character. You do not need to send the message.
 
-If the token is missing or expired, startup tries the same refresh path as pressing `r` in the server console. If Copilot has not created a Substrate WebSocket yet, click the Copilot message box and type one character. You do not need to send the message.
-
-Custom host/port:
+## Test It
 
 ```powershell
-uv run copilot-openai-proxy serve --host 127.0.0.1 --port 8000
+$body = @{
+  model = "m365-copilot"
+  messages = @(
+    @{ role = "user"; content = "Say hello in one short sentence." }
+  )
+} | ConvertTo-Json -Depth 10
+
+$r = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://127.0.0.1:8000/v1/chat/completions" `
+  -ContentType "application/json" `
+  -Body $body
+
+$r.choices[0].message.content
 ```
 
----
+## Connect A Client
 
-## Token Refresh
+Use these settings for any OpenAI-compatible client:
 
-Automatic refresh is on by default:
-
-```powershell
-uv run copilot-openai-proxy serve
-```
-
-Useful controls:
-
-```powershell
-uv run copilot-openai-proxy serve --refresh-before-seconds 300
-uv run copilot-openai-proxy serve --no-auto-refresh
-uv run copilot-openai-proxy serve --no-capture-on-start
-uv run copilot-openai-proxy serve --no-launch-edge
-```
-
-Manual fallback:
-
-```powershell
-uv run copilot-openai-proxy set-token
-```
-
-Then paste a fresh Substrate WebSocket URL:
-
-1. Open the signed-in M365 Copilot Edge window.
-2. Open DevTools (`F12`) -> **Network** tab.
-3. Filter by `substrate`.
-4. Click the WebSocket entry.
-5. Go to **Headers** -> right-click the **Request URL** -> **Copy link address**.
-6. Paste it into the terminal.
-
-The command extracts `access_token` automatically and writes it to `.env`.
-
-Token health:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/healthz
-Invoke-RestMethod http://127.0.0.1:8000/v1/token/status
-```
-
-Example response:
-
-```json
-{
-  "status": "ok",
-  "token": {
-    "valid": true,
-    "expires_at": "2026-05-14T02:50:53+00:00",
-    "seconds_remaining": 4200
-  }
-}
-```
-
----
-
-## Persistent Sessions
-
-By default, requests are stateless from the Copilot side.
-
-To reuse the same Copilot conversation across turns, send a stable session header:
-
-```http
-X-M365-Session-Id: my-work-session
-```
-
-Or use the persist model suffix:
-
-```text
-m365-copilot:persist
-```
-
-Header mode is better for coding tools if they support custom headers, because each tool/workspace can choose its own session id. If a client only supports changing the model name, `m365-copilot:persist` works, but clients that do not send a `user` field will share the same default persistent session until the proxy restarts.
-
----
-
-## Using With AI Coding Tools
+| Setting | Value |
+|---|---|
+| Base URL | `http://127.0.0.1:8000/v1` |
+| API Key | `dummy` |
+| Model | `m365-copilot` |
+| Persistent model | `m365-copilot:persist` |
 
 ### OpenCode
 
@@ -145,18 +76,21 @@ $env:OPENAI_API_KEY = "dummy"
 opencode
 ```
 
-Select **OpenAI API** as the provider.
-
-Use one of these models:
+Select **OpenAI API** as the provider, then use:
 
 ```text
 m365-copilot
+```
+
+For persistent Copilot-side conversation memory:
+
+```text
 m365-copilot:persist
 ```
 
-### Continue (VS Code extension)
+### Continue
 
-Add to `~/.continue/config.json`:
+Add this to `~/.continue/config.json`:
 
 ```json
 {
@@ -180,31 +114,113 @@ $env:ANTHROPIC_API_KEY = "dummy"
 claude
 ```
 
-### Any OpenAI-Compatible Client
+Claude Code note: this proxy does not implement tool use. It can answer general prompts, but agentic features such as file reading, bash, and code editing still require the real Anthropic API.
 
-| Setting | Value |
+## Persistent Sessions
+
+By default, requests are stateless from the Copilot side.
+
+To reuse the same Copilot conversation across turns, send a stable header:
+
+```http
+X-M365-Session-Id: my-work-session
+```
+
+Or use the model suffix:
+
+```text
+m365-copilot:persist
+```
+
+Header mode is better when your client supports custom headers, because each workspace or coding-agent session can choose its own id. If your client only lets you change the model name, use `m365-copilot:persist`.
+
+If a client uses `m365-copilot:persist` without sending a `user` field, all requests share one default persistent session until the proxy restarts.
+
+## Token Refresh
+
+M365 Copilot browser tokens usually expire in about 1 hour. The proxy refreshes them from the dedicated signed-in Edge window.
+
+Auto-refresh is on by default:
+
+```powershell
+uv run copilot-openai-proxy serve
+```
+
+Useful controls:
+
+```powershell
+uv run copilot-openai-proxy serve --refresh-before-seconds 300
+uv run copilot-openai-proxy serve --no-auto-refresh
+uv run copilot-openai-proxy serve --no-capture-on-start
+uv run copilot-openai-proxy serve --no-launch-edge
+```
+
+You can also press `r` in the server console to refresh the token manually.
+
+### Manual Fallback
+
+```powershell
+uv run copilot-openai-proxy set-token
+```
+
+Then paste a fresh Substrate WebSocket URL:
+
+1. Open the signed-in M365 Copilot Edge window.
+2. Open DevTools (`F12`) -> **Network** tab.
+3. Filter by `substrate`.
+4. Click the WebSocket entry.
+5. Go to **Headers** -> right-click the **Request URL** -> **Copy link address**.
+6. Paste it into the terminal.
+
+The command extracts `access_token` automatically and writes it to `.env`.
+
+## Token Health
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/healthz
+Invoke-RestMethod http://127.0.0.1:8000/v1/token/status
+```
+
+Example:
+
+```json
+{
+  "status": "ok",
+  "token": {
+    "valid": true,
+    "expires_at": "2026-05-14T02:50:53+00:00",
+    "seconds_remaining": 4200
+  }
+}
+```
+
+## API Endpoints
+
+| Endpoint | Description |
 |---|---|
-| Base URL | `http://127.0.0.1:8000/v1` |
-| API Key | `dummy` |
-| Model | `m365-copilot` or `m365-copilot:persist` |
+| `GET /healthz` | Service health plus token status |
+| `GET /v1/token/status` | Token validity, expiry time, and seconds remaining |
+| `GET /v1/models` | OpenAI-compatible model list |
+| `POST /v1/chat/completions` | OpenAI Chat Completions, streaming supported |
+| `POST /v1/responses` | OpenAI Responses API, streaming supported |
+| `POST /v1/messages` | Anthropic Messages API style endpoint |
 
----
+## More Examples
 
-## Manual API Examples
-
-### Chat Completions
+### Streaming
 
 ```powershell
 $body = @{
   model = "m365-copilot"
-  messages = @(
-    @{ role = "system"; content = "Be concise." },
-    @{ role = "user"; content = "hi" }
-  )
+  stream = $true
+  messages = @(@{ role = "user"; content = "hi" })
 } | ConvertTo-Json -Depth 10
 
-$r = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/v1/chat/completions" -ContentType "application/json" -Body $body
-$r.choices[0].message.content
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://127.0.0.1:8000/v1/chat/completions" `
+  -ContentType "application/json" `
+  -Body $body
 ```
 
 ### Persistent Session
@@ -217,25 +233,15 @@ $body = @{
   )
 } | ConvertTo-Json -Depth 10
 
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/v1/chat/completions" `
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://127.0.0.1:8000/v1/chat/completions" `
   -Headers @{ "X-M365-Session-Id" = "test1" } `
   -ContentType "application/json" `
   -Body $body
 ```
 
-### Streaming
-
-```powershell
-$body = @{
-  model = "m365-copilot"
-  stream = $true
-  messages = @(@{ role = "user"; content = "hi" })
-} | ConvertTo-Json -Depth 10
-
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/v1/chat/completions" -ContentType "application/json" -Body $body
-```
-
-### Anthropic-Style
+### Anthropic-Style Messages
 
 ```powershell
 $body = @{
@@ -244,22 +250,47 @@ $body = @{
   messages = @(@{ role = "user"; content = "hi" })
 } | ConvertTo-Json -Depth 10
 
-$r = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/v1/messages" -ContentType "application/json" -Body $body
+$r = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://127.0.0.1:8000/v1/messages" `
+  -ContentType "application/json" `
+  -Body $body
+
 $r.content[0].text
 ```
 
----
+## Security Notes
+
+- The proxy listens on `127.0.0.1` by default.
+- The browser token is stored locally in `.env`.
+- `.env`, `.venv/`, and Python cache files are ignored by Git.
+- The proxy does not send your token to any external service besides Microsoft 365 Copilot's own `substrate.office.com` endpoint.
+- Anyone who can read your `.env` can use the token until it expires. Treat it like a secret.
 
 ## Environment Variables
 
+Most users only need `.env` after the proxy captures a token.
+
 | Variable | Default | Description |
 |---|---|---|
-| `M365_ACCESS_TOKEN` | optional at startup | Bearer token from the browser WebSocket URL. If missing, startup capture can fill `.env`. |
+| `M365_ACCESS_TOKEN` | optional at startup | Browser WebSocket token. If missing, startup capture can fill `.env`. |
 | `M365_TIME_ZONE` | `Asia/Tokyo` | Optional. Time zone sent to Copilot. Usually no need to set this if `Asia/Tokyo` is correct. |
 | `M365_MODEL_ALIAS` | `m365-copilot` | Optional. Model name returned by `/v1/models`. Usually no need to change this. |
 
----
+## Limitations
+
+- This is an unofficial local proxy over the browser-facing M365 Copilot API.
+- Token refresh depends on a signed-in Edge profile.
+- Tool calls are not supported.
+- Token usage numbers are placeholders.
+- System prompts and prior conversation history are translated into plain text context.
 
 ## Token Automation Details
 
-See [TOKEN_REFRESH.md](TOKEN_REFRESH.md) for how the Edge CDP refresh path works.
+See [TOKEN_REFRESH.md](TOKEN_REFRESH.md) for the deeper Edge CDP refresh notes and alternatives.
+
+## Support
+
+If this project saves you time, please consider giving it a GitHub star. It helps other people find the repo.
+
+[![Star History Chart](https://api.star-history.com/svg?repos=kuchris/m365-copilot-openai-proxy&type=Date)](https://www.star-history.com/#kuchris/m365-copilot-openai-proxy&Date)
