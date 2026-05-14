@@ -285,6 +285,10 @@ Most users only need `.env` after the proxy captures a token.
 - Token usage numbers are placeholders.
 - System prompts and prior conversation history are translated into plain text context.
 
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
+
 ## Token Automation Details
 
 See [TOKEN_REFRESH.md](TOKEN_REFRESH.md) for the deeper Edge CDP refresh notes and alternatives.
