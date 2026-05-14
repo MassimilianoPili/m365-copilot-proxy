@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import time
 import uuid
@@ -8,6 +7,9 @@ from collections.abc import AsyncIterator
 from urllib.parse import quote
 
 import websockets
+
+from .session_store import PersistentSession
+from .token_store import decode_jwt_payload
 
 SIGNALR_SEP = "\x1e"
 _WS_BASE = "wss://substrate.office.com/m365Copilot/Chathub"
@@ -79,18 +81,17 @@ class SubstrateCopilotError(RuntimeError):
     pass
 
 
-def _decode_jwt_payload(token: str) -> dict:
-    payload = token.split(".")[1]
-    payload += "=" * (-len(payload) % 4)
-    return json.loads(base64.urlsafe_b64decode(payload))
-
-
 class SubstrateCopilotClient:
     def __init__(self, access_token: str, time_zone: str = "Asia/Tokyo"):
+        if not access_token:
+            raise SubstrateCopilotError(
+                "M365_ACCESS_TOKEN is missing. Start the debug Edge window and let startup token capture complete, "
+                "or run `uv run copilot-openai-proxy set-token`."
+            )
         self._token = access_token
         self._time_zone = time_zone
         try:
-            claims = _decode_jwt_payload(access_token)
+            claims = decode_jwt_payload(access_token)
         except Exception as exc:
             raise SubstrateCopilotError(f"Cannot decode access token: {exc}") from exc
         if time.time() > claims.get("exp", 0):
@@ -115,7 +116,14 @@ class SubstrateCopilotClient:
             f"&licenseType=Starter&agent=web&scenario=OfficeWebIncludedCopilot"
         )
 
-    def _chat_invoke(self, text: str, conv_id: str, session_id: str, req_id: str) -> str:
+    def _chat_invoke(
+        self,
+        text: str,
+        conv_id: str,
+        session_id: str,
+        req_id: str,
+        is_start_of_session: bool,
+    ) -> str:
         payload = {
             "arguments": [{
                 "source": "officeweb",
@@ -130,7 +138,7 @@ class SubstrateCopilotClient:
                 "sliceIds": [],
                 "threadLevelGptId": {},
                 "traceId": req_id,
-                "isStartOfSession": True,
+                "isStartOfSession": is_start_of_session,
                 "clientInfo": {
                     "clientPlatform": "mcmcopilot-web",
                     "clientAppName": "Office",
@@ -164,10 +172,40 @@ class SubstrateCopilotClient:
         }
         return json.dumps(payload, ensure_ascii=False) + SIGNALR_SEP
 
-    async def chat_stream(self, prompt: str, additional_context: list[str]) -> AsyncIterator[str]:
+    async def chat_stream(
+        self,
+        prompt: str,
+        additional_context: list[str],
+        session: PersistentSession | None = None,
+    ) -> AsyncIterator[str]:
         text = _combine_text(prompt, additional_context)
-        conv_id = str(uuid.uuid4())
-        session_id = str(uuid.uuid4())
+        if session is None:
+            async for chunk in self._chat_stream_for_turn(
+                text=text,
+                conv_id=str(uuid.uuid4()),
+                session_id=str(uuid.uuid4()),
+                is_start_of_session=True,
+            ):
+                yield chunk
+            return
+
+        async with session.lock:
+            turn = session.reserve_turn()
+            async for chunk in self._chat_stream_for_turn(
+                text=text,
+                conv_id=turn.conversation_id,
+                session_id=turn.client_session_id,
+                is_start_of_session=turn.is_start_of_session,
+            ):
+                yield chunk
+
+    async def _chat_stream_for_turn(
+        self,
+        text: str,
+        conv_id: str,
+        session_id: str,
+        is_start_of_session: bool,
+    ) -> AsyncIterator[str]:
         req_id = str(uuid.uuid4())
         url = self._ws_url(conv_id, session_id, req_id)
         try:
@@ -179,7 +217,7 @@ class SubstrateCopilotClient:
             ) as ws:
                 await ws.send(json.dumps({"protocol": "json", "version": 1}) + SIGNALR_SEP)
                 await ws.recv()
-                await ws.send(self._chat_invoke(text, conv_id, session_id, req_id))
+                await ws.send(self._chat_invoke(text, conv_id, session_id, req_id, is_start_of_session))
                 fallback_text = ""
                 yielded_any = False
                 async for raw in ws:
@@ -224,9 +262,14 @@ class SubstrateCopilotClient:
         except Exception as exc:
             raise SubstrateCopilotError(str(exc)) from exc
 
-    async def chat(self, prompt: str, additional_context: list[str]) -> str:
+    async def chat(
+        self,
+        prompt: str,
+        additional_context: list[str],
+        session: PersistentSession | None = None,
+    ) -> str:
         chunks: list[str] = []
-        async for chunk in self.chat_stream(prompt, additional_context):
+        async for chunk in self.chat_stream(prompt, additional_context, session):
             chunks.append(chunk)
         return "".join(chunks)
 

@@ -9,9 +9,14 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import Settings
+from .session_store import PersistentSession, PersistentSessionStore
 from .substrate_client import SubstrateCopilotClient, SubstrateCopilotError
+from .token_store import AccessTokenStore
 from .models import AnthropicMessagesRequest, OpenAIChatRequest, OpenAIResponsesRequest
 from .translator import translate_anthropic_request, translate_openai_request, translate_responses_request
+
+_PERSIST_MODEL_SUFFIX = ":persist"
+_SESSION_ID_HEADER = "x-m365-session-id"
 
 
 def create_app(
@@ -21,8 +26,10 @@ def create_app(
     app = FastAPI(title="Microsoft 365 Copilot OpenAI Proxy")
     resolved_settings = settings or Settings()
     app.state.settings = resolved_settings
+    app.state.token_store = AccessTokenStore(resolved_settings.access_token)
+    app.state.session_store = PersistentSessionStore()
     app.state.copilot_client_factory = copilot_client_factory or (
-        lambda: SubstrateCopilotClient(resolved_settings.access_token, resolved_settings.time_zone)
+        lambda: SubstrateCopilotClient(app.state.token_store.get(), resolved_settings.time_zone)
     )
 
     def get_settings() -> Settings:
@@ -32,8 +39,12 @@ def create_app(
         return app.state.copilot_client_factory()
 
     @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
-        return {"status": "ok"}
+    async def healthz() -> dict:
+        return {"status": "ok", "token": app.state.token_store.status()}
+
+    @app.get("/v1/token/status")
+    async def token_status() -> dict:
+        return app.state.token_store.status()
 
     @app.get("/v1/models")
     async def list_models(settings: Settings = Depends(get_settings)) -> dict:
@@ -50,12 +61,14 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(
+        raw_request: Request,
         request: OpenAIChatRequest,
         settings: Settings = Depends(get_settings),
         client: SubstrateCopilotClient = Depends(get_copilot_client),
     ):
         try:
             translated = translate_openai_request(request)
+            session = _persistent_session(app, raw_request, request.model, request.user)
             if request.stream:
                 return StreamingResponse(
                     _openai_stream(
@@ -63,10 +76,11 @@ def create_app(
                         client,
                         translated.prompt,
                         translated.additional_context,
+                        session,
                     ),
                     media_type="text/event-stream",
                 )
-            text = await client.chat(translated.prompt, translated.additional_context)
+            text = await client.chat(translated.prompt, translated.additional_context, session)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except SubstrateCopilotError as exc:
@@ -96,17 +110,18 @@ def create_app(
         try:
             request = OpenAIResponsesRequest.model_validate(body)
             translated = translate_responses_request(request)
+            session = _persistent_session(app, raw, request.model)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         if request.stream:
             return StreamingResponse(
-                _responses_stream(settings.model_alias, client, translated.prompt, translated.additional_context),
+                _responses_stream(settings.model_alias, client, translated.prompt, translated.additional_context, session),
                 media_type="text/event-stream",
             )
 
         try:
-            text = await client.chat(translated.prompt, translated.additional_context)
+            text = await client.chat(translated.prompt, translated.additional_context, session)
         except SubstrateCopilotError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -126,23 +141,25 @@ def create_app(
 
     @app.post("/v1/messages")
     async def anthropic_messages(
+        raw_request: Request,
         request: AnthropicMessagesRequest,
         settings: Settings = Depends(get_settings),
         client: SubstrateCopilotClient = Depends(get_copilot_client),
     ):
         try:
             translated = translate_anthropic_request(request)
+            session = _persistent_session(app, raw_request, request.model)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         if request.stream:
             return StreamingResponse(
-                _anthropic_stream(settings.model_alias, client, translated.prompt, translated.additional_context),
+                _anthropic_stream(settings.model_alias, client, translated.prompt, translated.additional_context, session),
                 media_type="text/event-stream",
             )
 
         try:
-            text = await client.chat(translated.prompt, translated.additional_context)
+            text = await client.chat(translated.prompt, translated.additional_context, session)
         except SubstrateCopilotError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -160,11 +177,26 @@ def create_app(
     return app
 
 
+def _persistent_session(
+    app: FastAPI,
+    raw_request: Request,
+    model: str,
+    fallback_key: str | None = None,
+) -> PersistentSession | None:
+    header_key = (raw_request.headers.get(_SESSION_ID_HEADER) or "").strip()
+    if header_key:
+        return app.state.session_store.get(f"header:{header_key}")
+    if model.endswith(_PERSIST_MODEL_SUFFIX):
+        return app.state.session_store.get(f"model:{fallback_key or 'default'}")
+    return None
+
+
 async def _openai_stream(
     model_alias: str,
     client: SubstrateCopilotClient,
     prompt: str,
     additional_context: list[str],
+    session: PersistentSession | None = None,
 ) -> AsyncIterator[str]:
     completion_id = f"chatcmpl_{uuid.uuid4().hex}"
     created = int(time.time())
@@ -176,7 +208,7 @@ async def _openai_stream(
         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
     }
     yield f"data: {json.dumps(first_chunk)}\n\n"
-    async for delta in client.chat_stream(prompt, additional_context):
+    async for delta in client.chat_stream(prompt, additional_context, session):
         chunk = {
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -201,6 +233,7 @@ async def _responses_stream(
     client: SubstrateCopilotClient,
     prompt: str,
     additional_context: list[str],
+    session: PersistentSession | None = None,
 ) -> AsyncIterator[str]:
     resp_id = f"resp_{uuid.uuid4().hex}"
     item_id = f"msg_{uuid.uuid4().hex}"
@@ -211,7 +244,7 @@ async def _responses_stream(
     yield f"data: {json.dumps({'type': 'response.content_part.added', 'item_id': item_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
 
     full_text = ""
-    async for delta in client.chat_stream(prompt, additional_context):
+    async for delta in client.chat_stream(prompt, additional_context, session):
         full_text += delta
         yield f"data: {json.dumps({'type': 'response.output_text.delta', 'item_id': item_id, 'output_index': 0, 'content_index': 0, 'delta': delta})}\n\n"
 
@@ -224,6 +257,7 @@ async def _anthropic_stream(
     client: SubstrateCopilotClient,
     prompt: str,
     additional_context: list[str],
+    session: PersistentSession | None = None,
 ) -> AsyncIterator[str]:
     msg_id = f"msg_{uuid.uuid4().hex}"
 
@@ -234,7 +268,7 @@ async def _anthropic_stream(
     yield sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
     yield sse("ping", {"type": "ping"})
 
-    async for delta in client.chat_stream(prompt, additional_context):
+    async for delta in client.chat_stream(prompt, additional_context, session):
         yield sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": delta}})
 
     yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})

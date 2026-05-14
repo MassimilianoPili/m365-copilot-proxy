@@ -49,17 +49,34 @@ Schedule with `schedule` or `apscheduler` every 50 minutes.
 
 ## Option B — Edge remote debugging (CDP)
 
-Launch Edge once with the remote debugging flag, then connect to the running browser via CDP without opening a new one.
+Launch a dedicated Edge profile with the remote debugging flag, then connect to it via CDP.
 
-**One-time setup:** create an Edge shortcut with extra flag:
+**Start the server:**
+```powershell
+uv run copilot-openai-proxy serve
 ```
-"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9222
+
+`serve` opens the dedicated debug Edge window by default. Sign in to M365 Copilot in that window once.
+The profile is stored under
+`%USERPROFILE%\.m365-copilot-openai-proxy\edge-profile`, so later launches can reuse the sign-in.
+Then the server connects to `http://localhost:9222` and extracts the token from the Copilot tab.
+`uv run copilot-openai-proxy serve` starts an auto-refresh loop by default. It refreshes when the
+current JWT has less than 5 minutes left.
+If the current token is missing, expired, or not a Substrate token, `serve` first tries the same `r`-style
+refresh from the current debug Edge tab. If no Substrate token is available yet, it starts a one-shot
+startup capture listener. Generate a new WebSocket by pressing `F5` in the debug Edge Copilot tab, clicking
+the message box, and typing one character. The message does not need to be sent.
+
+Useful serve flags:
+```powershell
+uv run copilot-openai-proxy serve --refresh-before-seconds 300
+uv run copilot-openai-proxy serve --no-launch-edge
+uv run copilot-openai-proxy serve --no-capture-on-start
+uv run copilot-openai-proxy serve --no-auto-refresh
 ```
 
-Then a script connects to `http://localhost:9222` and executes JS in the Copilot tab to extract the token.
-
-**Pros:** lightweight, no new browser, uses `websockets` (already installed)  
-**Cons:** Edge must always be launched with the debug flag; less reliable if tab is closed
+**Pros:** lightweight, uses `websockets` (already installed), works even if normal Edge is already open  
+**Cons:** requires a separate Edge profile; less reliable if the Copilot tab is closed
 
 ---
 
