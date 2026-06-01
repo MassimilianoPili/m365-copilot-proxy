@@ -8,11 +8,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+SUBSTRATE_AUDIENCE_PREFIX = "https://substrate.office.com/"
+
 
 def decode_jwt_payload(token: str) -> dict[str, Any]:
     payload = token.split(".")[1]
     payload += "=" * (-len(payload) % 4)
     return json.loads(base64.urlsafe_b64decode(payload))
+
+
+def is_substrate_token_claims(claims: dict[str, Any]) -> bool:
+    return str(claims.get("aud", "")).startswith(SUBSTRATE_AUDIENCE_PREFIX)
 
 
 class AccessTokenStore:
@@ -32,6 +38,13 @@ class AccessTokenStore:
         now = time.time()
         try:
             claims = decode_jwt_payload(token)
+            if not is_substrate_token_claims(claims):
+                return {
+                    "valid": False,
+                    "error": "Access token is not a substrate.office.com token.",
+                    "expires_at": None,
+                    "seconds_remaining": 0,
+                }
             expires_at = int(claims["exp"])
         except Exception as exc:
             return {

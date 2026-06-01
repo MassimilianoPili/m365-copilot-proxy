@@ -9,7 +9,7 @@ from urllib.parse import quote
 import websockets
 
 from .session_store import PersistentSession
-from .token_store import decode_jwt_payload
+from .token_store import decode_jwt_payload, is_substrate_token_claims
 
 SIGNALR_SEP = "\x1e"
 _WS_BASE = "wss://substrate.office.com/m365Copilot/Chathub"
@@ -94,6 +94,8 @@ class SubstrateCopilotClient:
             claims = decode_jwt_payload(access_token)
         except Exception as exc:
             raise SubstrateCopilotError(f"Cannot decode access token: {exc}") from exc
+        if not is_substrate_token_claims(claims):
+            raise SubstrateCopilotError("Access token is not a substrate.office.com token.")
         if time.time() > claims.get("exp", 0):
             raise SubstrateCopilotError(
                 "Access token expired. To refresh: open M365 Copilot in your browser, "

@@ -208,15 +208,20 @@ async def _openai_stream(
         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
     }
     yield f"data: {json.dumps(first_chunk)}\n\n"
-    async for delta in client.chat_stream(prompt, additional_context, session):
-        chunk = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model_alias,
-            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-        }
-        yield f"data: {json.dumps(chunk)}\n\n"
+    try:
+        async for delta in client.chat_stream(prompt, additional_context, session):
+            chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_alias,
+                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+    except SubstrateCopilotError as exc:
+        yield f"data: {json.dumps({'error': {'message': str(exc), 'type': 'upstream_error'}})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
     final_chunk = {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -244,9 +249,13 @@ async def _responses_stream(
     yield f"data: {json.dumps({'type': 'response.content_part.added', 'item_id': item_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
 
     full_text = ""
-    async for delta in client.chat_stream(prompt, additional_context, session):
-        full_text += delta
-        yield f"data: {json.dumps({'type': 'response.output_text.delta', 'item_id': item_id, 'output_index': 0, 'content_index': 0, 'delta': delta})}\n\n"
+    try:
+        async for delta in client.chat_stream(prompt, additional_context, session):
+            full_text += delta
+            yield f"data: {json.dumps({'type': 'response.output_text.delta', 'item_id': item_id, 'output_index': 0, 'content_index': 0, 'delta': delta})}\n\n"
+    except SubstrateCopilotError as exc:
+        yield f"data: {json.dumps({'type': 'error', 'error': {'message': str(exc), 'type': 'upstream_error'}})}\n\n"
+        return
 
     yield f"data: {json.dumps({'type': 'response.output_text.done', 'item_id': item_id, 'output_index': 0, 'content_index': 0, 'text': full_text})}\n\n"
     yield f"data: {json.dumps({'type': 'response.completed', 'response': {'id': resp_id, 'object': 'response', 'created_at': created, 'model': model_alias, 'status': 'completed', 'output': [{'id': item_id, 'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': full_text}]}], 'usage': {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}}})}\n\n"
@@ -268,8 +277,12 @@ async def _anthropic_stream(
     yield sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
     yield sse("ping", {"type": "ping"})
 
-    async for delta in client.chat_stream(prompt, additional_context, session):
-        yield sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": delta}})
+    try:
+        async for delta in client.chat_stream(prompt, additional_context, session):
+            yield sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": delta}})
+    except SubstrateCopilotError as exc:
+        yield sse("error", {"type": "error", "error": {"type": "upstream_error", "message": str(exc)}})
+        return
 
     yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
     yield sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 0}})

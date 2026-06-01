@@ -83,6 +83,8 @@ def translate_responses_request(request: "OpenAIResponsesRequest") -> Translated
             system_lines.append(text)
             continue
         if is_last:
+            if role != "user":
+                raise ValueError("The final Responses input message must be a user message.")
             prompt = text
             continue
         transcript_lines.append(f"{role.capitalize()}: {text}")

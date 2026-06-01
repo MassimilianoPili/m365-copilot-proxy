@@ -16,7 +16,7 @@ import uvicorn
 import websockets
 
 from .app import create_app
-from .token_store import decode_jwt_payload
+from .token_store import decode_jwt_payload, is_substrate_token_claims
 
 
 class _SuppressCtrlC(logging.Filter):
@@ -247,10 +247,10 @@ async def _cdp_nudge_and_wait_for_token(ws) -> str | None:
 
 def _is_substrate_token(token: str) -> bool:
     try:
-        audience = str(decode_jwt_payload(token).get("aud", ""))
+        claims = decode_jwt_payload(token)
     except Exception:
         return False
-    return audience.startswith("https://substrate.office.com/")
+    return is_substrate_token_claims(claims)
 
 
 def _try_auto_refresh(cdp_port: int, *, allow_nudge: bool = True) -> bool:
@@ -308,10 +308,12 @@ def _auto_refresh_loop(
 
 def _write_token(token: str) -> None:
     env_path = Path(".env")
+    token_line_pattern = r"(?m)^M365_ACCESS_TOKEN=.*$"
     if env_path.exists():
         text = env_path.read_text(encoding="utf-8")
-        text = re.sub(r"(?m)^M365_ACCESS_TOKEN=.*$", f"M365_ACCESS_TOKEN={token}", text)
-        if "M365_ACCESS_TOKEN=" not in text:
+        if re.search(token_line_pattern, text):
+            text = re.sub(token_line_pattern, f"M365_ACCESS_TOKEN={token}", text)
+        else:
             text += f"\nM365_ACCESS_TOKEN={token}\n"
     else:
         text = f"M365_ACCESS_TOKEN={token}\n"

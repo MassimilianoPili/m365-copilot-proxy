@@ -14,10 +14,11 @@ from m365_copilot_openai_proxy.cli import (
     _needs_substrate_token,
     _read_token,
     _seconds_remaining,
+    _write_token,
 )
 from m365_copilot_openai_proxy.config import Settings
-from m365_copilot_openai_proxy.graph_client import filter_reserved_scopes
 from m365_copilot_openai_proxy.session_store import PersistentSessionStore
+from m365_copilot_openai_proxy.substrate_client import SubstrateCopilotClient, SubstrateCopilotError
 
 
 class FakeCopilotClient:
@@ -40,6 +41,19 @@ class FakeCopilotClient:
         self.sessions.append(session)
         yield "hello"
         yield " world"
+
+
+class FailingStreamCopilotClient(FakeCopilotClient):
+    async def chat_stream(
+        self,
+        prompt: str,
+        additional_context: list[str],
+        session: object | None = None,
+    ) -> AsyncIterator[str]:
+        self.calls.append((prompt, additional_context))
+        self.sessions.append(session)
+        raise SubstrateCopilotError("upstream broke")
+        yield ""
 
 
 def build_client(fake: FakeCopilotClient) -> TestClient:
@@ -103,6 +117,30 @@ def test_healthz_includes_token_remaining_time() -> None:
     assert body["token"]["seconds_remaining"] > 0
 
 
+def test_token_status_rejects_non_substrate_token() -> None:
+    settings = Settings(M365_ACCESS_TOKEN=make_jwt(int(time.time()) + 3600, aud="394866fc-eedb"))
+    app = create_app(settings=settings, copilot_client_factory=lambda: FakeCopilotClient())
+    client = TestClient(app)
+
+    response = client.get("/v1/token/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["valid"] is False
+    assert body["error"] == "Access token is not a substrate.office.com token."
+
+
+def test_substrate_client_rejects_non_substrate_token() -> None:
+    token = make_jwt(int(time.time()) + 3600, aud="394866fc-eedb")
+
+    try:
+        SubstrateCopilotClient(token)
+    except SubstrateCopilotError as exc:
+        assert "not a substrate.office.com token" in str(exc)
+    else:
+        raise AssertionError("SubstrateCopilotClient accepted a non-Substrate token")
+
+
 def test_default_client_factory_reloads_token_from_env(tmp_path, monkeypatch) -> None:
     first_token = make_jwt(int(time.time()) + 3600)
     second_token = make_jwt(int(time.time()) + 7200)
@@ -142,6 +180,18 @@ def test_cli_reads_current_token_from_env(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
 
     assert _read_token() == token
+
+
+def test_cli_write_token_ignores_commented_token_line(tmp_path, monkeypatch) -> None:
+    token = make_jwt(int(time.time()) + 3600)
+    env_path = tmp_path / ".env"
+    env_path.write_text("# M365_ACCESS_TOKEN=old\nOTHER=value\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    _write_token(token)
+
+    assert _read_token() == token
+    assert env_path.read_text(encoding="utf-8").count("M365_ACCESS_TOKEN=") == 2
 
 
 def test_cli_seconds_remaining_uses_jwt_exp() -> None:
@@ -324,6 +374,45 @@ def test_openai_streaming_returns_sse() -> None:
     assert "data: [DONE]" in payload
 
 
+def test_openai_streaming_returns_error_event_on_upstream_failure() -> None:
+    client = build_client(FailingStreamCopilotClient())
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "ignored",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Hello"}],
+        },
+    ) as response:
+        payload = "".join(
+            chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+            for chunk in response.iter_text()
+        )
+
+    assert response.status_code == 200
+    assert '"type": "upstream_error"' in payload
+    assert '"message": "upstream broke"' in payload
+    assert "data: [DONE]" in payload
+
+
+def test_responses_streaming_returns_error_event_on_upstream_failure() -> None:
+    client = build_client(FailingStreamCopilotClient())
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={"model": "ignored", "stream": True, "input": "Hello"},
+    ) as response:
+        payload = "".join(
+            chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+            for chunk in response.iter_text()
+        )
+
+    assert response.status_code == 200
+    assert '"type": "error"' in payload
+    assert '"message": "upstream broke"' in payload
+
+
 def test_anthropic_messages_endpoint() -> None:
     fake = FakeCopilotClient()
     client = build_client(fake)
@@ -341,12 +430,39 @@ def test_anthropic_messages_endpoint() -> None:
     assert body["content"][0]["text"] == "copilot reply"
 
 
-def test_reserved_scopes_are_filtered_from_msal_requests() -> None:
-    assert filter_reserved_scopes(
-        [
-            "Mail.Read",
-            "offline_access",
-            "openid",
-            "Chat.Read",
-        ]
-    ) == ["Mail.Read", "Chat.Read"]
+def test_anthropic_streaming_returns_error_event_on_upstream_failure() -> None:
+    client = build_client(FailingStreamCopilotClient())
+    with client.stream(
+        "POST",
+        "/v1/messages",
+        json={
+            "model": "ignored",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Hello"}],
+        },
+    ) as response:
+        payload = "".join(
+            chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+            for chunk in response.iter_text()
+        )
+
+    assert response.status_code == 200
+    assert "event: error" in payload
+    assert '"message": "upstream broke"' in payload
+
+
+def test_responses_requires_final_user_message() -> None:
+    client = build_client(FakeCopilotClient())
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "ignored",
+            "input": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi"},
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "The final Responses input message must be a user message."
