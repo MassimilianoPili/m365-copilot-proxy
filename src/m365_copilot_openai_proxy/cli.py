@@ -445,40 +445,70 @@ def _read_env_value(key: str) -> str | None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="copilot-openai-proxy")
+    _attach_parent_console()
+    parser = argparse.ArgumentParser(
+        prog="copilot-openai-proxy",
+        description="M365 Copilot <-> OpenAI/Anthropic proxy. Bare invocation defaults to 'serve'.",
+    )
     # Not required: a bare invocation (e.g. double-clicking the .exe) defaults to `serve`.
     subparsers = parser.add_subparsers(dest="command", required=False)
 
-    subparsers.add_parser("set-token").set_defaults(func=set_token_command)
-    capture_parser = subparsers.add_parser("capture-token")
-    capture_parser.add_argument("--cdp-port", type=int, default=9222)
-    capture_parser.add_argument("--timeout-seconds", type=int, default=60)
+    subparsers.add_parser(
+        "set-token", help="paste a substrate access token or WebSocket URL into .env"
+    ).set_defaults(func=set_token_command)
+    capture_parser = subparsers.add_parser("capture-token", help="listen for a substrate token via Edge CDP")
+    capture_parser.add_argument("--cdp-port", type=int, default=9222, help="Edge remote-debugging port (default: 9222)")
+    capture_parser.add_argument("--timeout-seconds", type=int, default=60, help="give up after this many seconds (default: 60)")
     capture_parser.set_defaults(func=capture_token_command)
 
-    launch_parser = subparsers.add_parser("launch-edge")
-    launch_parser.add_argument("--cdp-port", type=int, default=9222)
+    launch_parser = subparsers.add_parser("launch-edge", help="open the dedicated debug Edge window for M365 Copilot")
+    launch_parser.add_argument("--cdp-port", type=int, default=9222, help="Edge remote-debugging port (default: 9222)")
     launch_parser.set_defaults(func=launch_edge_command)
 
-    serve_parser = subparsers.add_parser("serve")
-    serve_parser.add_argument("--host", default="127.0.0.1")
-    serve_parser.add_argument("--port", type=int, default=8000)
-    serve_parser.add_argument("--cdp-port", type=int, default=9222)
-    serve_parser.add_argument("--no-auto-refresh", action="store_true")
-    serve_parser.add_argument("--no-launch-edge", action="store_true")
-    serve_parser.add_argument("--no-capture-on-start", action="store_true")
-    serve_parser.add_argument("--capture-timeout-seconds", type=int, default=180)
-    # Refresh well before expiry for safety (env M365_REFRESH_BEFORE, default 15 min).
+    serve_parser = subparsers.add_parser("serve", help="start the proxy server (default when no command is given)")
+    serve_parser.add_argument("--host", default="127.0.0.1", help="listen address (default: 127.0.0.1)")
+    serve_parser.add_argument("--port", type=int, default=8000, help="listen port (default: 8000)")
+    serve_parser.add_argument("--cdp-port", type=int, default=9222, help="Edge remote-debugging port (default: 9222)")
+    serve_parser.add_argument("--no-auto-refresh", action="store_true", help="disable automatic token refresh")
+    serve_parser.add_argument("--no-launch-edge", action="store_true", help="don't open a debug Edge window on start")
+    serve_parser.add_argument("--no-capture-on-start", action="store_true", help="don't capture a token at startup")
+    serve_parser.add_argument("--capture-timeout-seconds", type=int, default=180, help="startup token-capture timeout (default: 180)")
     serve_parser.add_argument(
         "--refresh-before-seconds", type=int,
         default=int(os.environ.get("M365_REFRESH_BEFORE", "900")),
+        help="refresh the token this many seconds before expiry (default: 900 / env M365_REFRESH_BEFORE)",
     )
-    serve_parser.add_argument("--refresh-retry-seconds", type=int, default=60)
+    serve_parser.add_argument("--refresh-retry-seconds", type=int, default=60, help="wait between refresh retries (default: 60)")
+    serve_parser.add_argument(
+        "--no-configure-clients", action="store_true",
+        help="don't wire Claude Code/VS Code to the proxy on start (and don't undo on stop)",
+    )
     serve_parser.set_defaults(func=serve_command)
+
+    configure_parser = subparsers.add_parser(
+        "configure", help="wire Claude Code (global env) + VS Code (custom endpoint) to the proxy"
+    )
+    configure_parser.add_argument("--undo", action="store_true", help="remove the proxy wiring instead of adding it")
+    configure_parser.set_defaults(func=configure_command)
+
+    subparsers.add_parser("tray", help="open the tray app (default when double-clicked)").set_defaults(func=tray_command)
 
     args = parser.parse_args()
     if not getattr(args, "command", None):
-        args = parser.parse_args(["serve"])  # bare run -> serve with defaults
-    args.func(args)
+        # Bare run (double-click) -> tray app; fall back to console serve if the GUI deps are missing.
+        try:
+            from .tray_app import run_tray
+
+            run_tray()
+            return
+        except Exception as exc:
+            print(f"(tray app unavailable: {exc}; falling back to console serve)")
+            args = parser.parse_args(["serve"])
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        # Clean exit on Ctrl+C (cleanup already ran in serve_command's finally) — no traceback.
+        pass
 
 
 def launch_edge_command(args: argparse.Namespace) -> None:
@@ -541,7 +571,138 @@ def capture_token_command(args: argparse.Namespace) -> None:
     print(".env updated with Substrate token.")
 
 
+_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
+_VSCODE_MODEL_ID = "m365-opus:persist"
+
+
+def _vscode_models_path() -> Path | None:
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    user_dir = Path(appdata) / "Code" / "User"
+    return user_dir / "chatLanguageModels.json" if user_dir.is_dir() else None
+
+
+def _load_json(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def _configure_clients(undo: bool, base_url: str = "http://127.0.0.1:8000") -> None:
+    """Wire Claude Code (global) and VS Code to the proxy, or remove that wiring (undo).
+    Only the keys/entries this manages are touched; the rest of each file is preserved."""
+    # Claude Code global env (~/.claude/settings.json) -> routes Claude Code through the proxy.
+    try:
+        data = _load_json(_CLAUDE_SETTINGS, {})
+        env_val = data.get("env")
+        env = env_val if isinstance(env_val, dict) else {}
+        if undo:
+            if env.get("ANTHROPIC_BASE_URL") == base_url:
+                env.pop("ANTHROPIC_BASE_URL", None)
+                env.pop("ANTHROPIC_API_KEY", None)
+        else:
+            env["ANTHROPIC_BASE_URL"] = base_url
+            env["ANTHROPIC_API_KEY"] = "dummy"
+        if env:
+            data["env"] = env
+        else:
+            data.pop("env", None)
+        _CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        _CLAUDE_SETTINGS.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        if undo:
+            print(f"  - Claude Code: removed proxy env from {_CLAUDE_SETTINGS}")
+        else:
+            print(f"  + Claude Code: ANTHROPIC_BASE_URL={base_url} -> {_CLAUDE_SETTINGS}")
+    except Exception as exc:  # never let config wiring break serve
+        print(f"  ! Claude settings not updated: {exc}")
+
+    # VS Code custom-endpoint model (%APPDATA%/Code/User/chatLanguageModels.json).
+    vs = _vscode_models_path()
+    if vs is not None:
+        try:
+            arr = _load_json(vs, [])
+            if not isinstance(arr, list):
+                arr = []
+            ep = next((e for e in arr if isinstance(e, dict) and e.get("vendor") == "customendpoint"), None)
+            if undo:
+                if ep is not None:
+                    ep["models"] = [m for m in ep.get("models", []) if m.get("id") != _VSCODE_MODEL_ID]
+                    if not ep["models"]:
+                        arr = [e for e in arr if e is not ep]
+            else:
+                model = {
+                    "id": _VSCODE_MODEL_ID,
+                    "name": "M365 Opus 4.6 [200k] (proxy-default)",
+                    "url": f"{base_url}/v1/chat/completions",
+                    "toolCalling": True,
+                    "vision": True,
+                    "maxInputTokens": 200000,
+                    "maxOutputTokens": 16000,
+                }
+                if ep is None:
+                    arr.append({"name": "Custom Endpoint", "vendor": "customendpoint", "models": [model]})
+                else:
+                    models = [m for m in ep.get("models", []) if m.get("id") != _VSCODE_MODEL_ID]
+                    models.append(model)
+                    ep["models"] = models
+            vs.write_text(json.dumps(arr, indent=2, ensure_ascii=False), encoding="utf-8")
+            if undo:
+                print(f"  - VS Code: removed model {_VSCODE_MODEL_ID} from {vs}")
+            else:
+                print(f"  + VS Code: added model {_VSCODE_MODEL_ID} -> {vs}")
+        except Exception as exc:
+            print(f"  ! VS Code models not updated: {exc}")
+
+    print(f"  client config {'removed' if undo else 'applied'} (Claude Code + VS Code)")
+
+
+def configure_command(args: argparse.Namespace) -> None:
+    _configure_clients(undo=args.undo)
+
+
+def tray_command(_args: argparse.Namespace) -> None:
+    from .tray_app import run_tray
+
+    run_tray()
+
+
+def _attach_parent_console() -> None:
+    """The windowed build has no console. If launched from a terminal, attach to the parent
+    console so CLI subcommands (serve/configure/--help/set-token) show output and read input.
+    A double-click has no parent console, so this no-ops and the app stays a pure GUI."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        if ctypes.windll.kernel32.AttachConsole(-1):  # ATTACH_PARENT_PROCESS
+            sys.stdout = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+            sys.stderr = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+            try:
+                sys.stdin = open("CONIN$", "r", encoding="utf-8")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def serve_command(args: argparse.Namespace) -> None:
+    base_url = f"http://{args.host}:{args.port}"
+    wire = not getattr(args, "no_configure_clients", False)
+    if wire:
+        _configure_clients(undo=False, base_url=base_url)
+    try:
+        _run_server(args)
+    finally:
+        # Clean exits (q / Ctrl+C / window close) revert the wiring; a hard kill leaves it,
+        # and the next `serve` re-applies it. So clients point at the proxy only while it runs.
+        if wire:
+            _configure_clients(undo=True, base_url=base_url)
+
+
+def _run_server(args: argparse.Namespace) -> None:
     cdp_port: int = args.cdp_port
     while True:
         app = create_app()
@@ -591,25 +752,31 @@ def serve_command(args: argparse.Namespace) -> None:
         # (redirected stdin, background, .bat with start /min), just run the server; the
         # auto-refresh thread keeps the token fresh regardless.
         kb_ok = bool(getattr(sys.stdin, "isatty", lambda: False)())
-        while thread.is_alive():
-            if kb_ok:
-                try:
-                    if msvcrt.kbhit():
-                        key = msvcrt.getwch().lower()
-                        if key == "q":
-                            action = "quit"
-                            server.should_exit = True
-                            break
-                        elif key == "r":
-                            action = "refresh"
-                            server.should_exit = True
-                            break
-                except OSError:
-                    kb_ok = False
-            time.sleep(0.05)
+        try:
+            while thread.is_alive():
+                if kb_ok:
+                    try:
+                        if msvcrt.kbhit():
+                            key = msvcrt.getwch().lower()
+                            if key == "q":
+                                action = "quit"
+                                server.should_exit = True
+                                break
+                            elif key == "r":
+                                action = "refresh"
+                                server.should_exit = True
+                                break
+                    except OSError:
+                        kb_ok = False
+                time.sleep(0.05)
+        except KeyboardInterrupt:
+            # Ctrl+C: ask uvicorn to stop, then fall through to the clean shutdown path so
+            # serve_command's `finally` can undo the client wiring.
+            action = "quit"
+            server.should_exit = True
 
         stop_auto_refresh.set()
-        thread.join()
+        thread.join(timeout=5)
         if auto_refresh_thread:
             auto_refresh_thread.join(timeout=1)
         if capture_thread:

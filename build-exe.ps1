@@ -11,18 +11,23 @@ $exe = Join-Path $root "dist\m365-copilot-proxy.exe"
 # [0/3] Kill any running instance, otherwise the locked .exe can't be overwritten/signed
 #       (a stray instance silently leaves the OLD binary in place -> "it didn't update").
 Write-Host "[0/3] Stopping any running instance..." -ForegroundColor Cyan
+# Match by NAME too: a onefile exe runs from a temp _MEI path, so matching only $_.Path misses it
+# and the file stays locked at sign time.
+Get-Process -Name "m365-copilot-proxy" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Get-Process -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -eq $exe } |
-    ForEach-Object { Write-Host "  killing pid $($_.Id)"; Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Seconds 1
+    ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 2
 
 Write-Host "[1/3] Clean PyInstaller build..." -ForegroundColor Cyan
 Remove-Item -Recurse -Force "$root\build", "$root\dist", "$root\m365-copilot-proxy.spec" -ErrorAction SilentlyContinue
-& "$root\.venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --console `
+& "$root\.venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --windowed `
     --name m365-copilot-proxy --icon "assets\icon.ico" `
     --collect-data m365_copilot_openai_proxy `
     --collect-submodules m365_copilot_openai_proxy `
     --collect-all uvicorn `
+    --collect-all customtkinter `
+    --collect-all pystray `
     build_entry.py
 if (-not (Test-Path $exe)) { throw "build failed: $exe not found" }
 
