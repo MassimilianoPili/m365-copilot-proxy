@@ -446,7 +446,8 @@ def _read_env_value(key: str) -> str | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="copilot-openai-proxy")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    # Not required: a bare invocation (e.g. double-clicking the .exe) defaults to `serve`.
+    subparsers = parser.add_subparsers(dest="command", required=False)
 
     subparsers.add_parser("set-token").set_defaults(func=set_token_command)
     capture_parser = subparsers.add_parser("capture-token")
@@ -475,6 +476,8 @@ def main() -> None:
     serve_parser.set_defaults(func=serve_command)
 
     args = parser.parse_args()
+    if not getattr(args, "command", None):
+        args = parser.parse_args(["serve"])  # bare run -> serve with defaults
     args.func(args)
 
 
