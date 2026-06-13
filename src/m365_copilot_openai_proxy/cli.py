@@ -518,7 +518,23 @@ def launch_edge_command(args: argparse.Namespace) -> None:
 _DEFAULT_EDGE_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 
 
+def _edge_debug_tabs(cdp_port: int) -> list[dict] | None:
+    """Tabs from an already-running debug Edge, or None if none is reachable on the port."""
+    try:
+        with httpx.Client(timeout=1) as client:
+            return client.get(f"http://localhost:{cdp_port}/json").json()
+    except Exception:
+        return None
+
+
 def _launch_debug_edge(cdp_port: int) -> None:
+    # Reuse an already-open debug Edge: if the M365 page is up on this port, don't spawn a
+    # second process / duplicate tab — just return.
+    tabs = _edge_debug_tabs(cdp_port)
+    if tabs is not None and _find_m365_page(tabs):
+        print(f"Edge already open with the M365 page on debug port {cdp_port}; reusing it.")
+        return
+
     profile_dir = Path.home() / ".m365-copilot-openai-proxy" / "edge-profile"
     profile_dir.mkdir(parents=True, exist_ok=True)
     edge_path = _read_env_value("M365_EDGE_PATH") or _DEFAULT_EDGE_PATH
@@ -528,7 +544,8 @@ def _launch_debug_edge(cdp_port: int) -> None:
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
     ]
-    if (os.environ.get("M365_EDGE_HEADLESS") or "").strip().lower() in ("1", "true", "yes", "on"):
+    headless = (os.environ.get("M365_EDGE_HEADLESS") or "").strip().lower() in ("1", "true", "yes", "on")
+    if headless:
         # Invisible refresh — works only if the profile is already signed in and the tenant
         # does not require interactive WAM re-auth. First sign-in must be done non-headless.
         argv += ["--headless=new", "--disable-gpu"]
@@ -536,10 +553,17 @@ def _launch_debug_edge(cdp_port: int) -> None:
     # Detach from this process's job object so Edge survives when the launcher (uv run) exits
     # or when `serve` is restarted — otherwise the job teardown kills the browser.
     flags = 0
+    startupinfo = None
     if os.name == "nt":
         flags = 0x00000008 | 0x01000000 | 0x00000200  # DETACHED_PROCESS | BREAKAWAY_FROM_JOB | NEW_PROCESS_GROUP
-    subprocess.Popen(argv, creationflags=flags, close_fds=True)
-    print(f"Edge launched with remote debugging on port {cdp_port}.")
+        if not headless:
+            # Start the Edge window minimized so it doesn't steal focus on every serve start.
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 6  # SW_SHOWMINIMIZED
+    subprocess.Popen(argv, creationflags=flags, startupinfo=startupinfo, close_fds=True)
+    where = "headless" if headless else "minimized"
+    print(f"Edge launched ({where}) with remote debugging on port {cdp_port}.")
     print(f"Dedicated Edge profile: {profile_dir}")
     print("Sign in to M365 Copilot in that window once, then retry refresh.")
 

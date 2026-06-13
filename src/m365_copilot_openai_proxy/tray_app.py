@@ -5,8 +5,9 @@ Connected/Disconnected toggle. Starting/stopping reuses the `serve` internals (t
 auto-refresh, client wiring). With the windowed build there is no console, so stdout/logging is
 redirected into the in-app Logs tab.
 
-Update is opt-in: on launch it checks the GitHub release and, if newer, shows a pop-up; it only
-downloads the signed .exe and swaps-on-restart when the user accepts.
+Update is opt-in: on launch it checks the GitHub release and, if newer, shows a pop-up; when the
+user accepts it downloads the signed Inno installer and runs it silently, then quits so the
+installer can upgrade the per-user folder in place and relaunch the new build.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from importlib import resources
@@ -51,10 +53,6 @@ _DEFAULT_SETTINGS = {
 
 def _pkg_file(name: str) -> str:
     return str(resources.files(__package__).joinpath(name))
-
-
-def _current_exe() -> Path | None:
-    return Path(sys.executable) if getattr(sys, "frozen", False) else None
 
 
 def _hide_console() -> None:
@@ -192,6 +190,35 @@ def _version_tuple(s: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", s)[:3])
 
 
+def _current_exe() -> Path | None:
+    return Path(sys.executable) if getattr(sys, "frozen", False) else None
+
+
+def _is_installed() -> bool:
+    """True if this build runs from the per-user install dir (Inno installer) rather than as the
+    portable single-file. Drives whether updates upgrade in place via the installer or swap the exe."""
+    base = os.environ.get("LOCALAPPDATA")
+    exe = _current_exe()
+    if not base or exe is None:
+        return False
+    try:
+        return exe.resolve().is_relative_to((Path(base) / "Programs" / "M365CopilotProxy").resolve())
+    except Exception:
+        return False
+
+
+def _download(url: str, dest: Path) -> bool:
+    try:
+        with httpx.stream("GET", url, timeout=180, follow_redirects=True) as r:
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_bytes():
+                    f.write(chunk)
+        return True
+    except Exception:
+        return False
+
+
 def check_update() -> tuple[str, str] | None:
     try:
         r = httpx.get(
@@ -203,7 +230,13 @@ def check_update() -> tuple[str, str] | None:
         tag = data.get("tag_name", "")
         if _version_tuple(tag) <= _version_tuple(APP_VERSION):
             return None
-        asset = next((a for a in data.get("assets", []) if str(a.get("name", "")).endswith(".exe")), None)
+        exes = [a for a in data.get("assets", []) if str(a.get("name", "")).lower().endswith(".exe")]
+        # Installed build -> the Inno "Setup" installer; portable build -> the plain (non-Setup) exe.
+        # Strict per-mode match keeps a portable install portable (never migrate it to installed).
+        if _is_installed():
+            asset = next((a for a in exes if "setup" in str(a.get("name", "")).lower()), None)
+        else:
+            asset = next((a for a in exes if "setup" not in str(a.get("name", "")).lower()), None)
         if asset:
             return tag, asset["browser_download_url"]
     except Exception:
@@ -212,17 +245,28 @@ def check_update() -> tuple[str, str] | None:
 
 
 def apply_update(asset_url: str) -> bool:
+    """Installed build -> run the Inno installer silently (upgrade in place). Portable build ->
+    swap the single .exe on restart. The caller quits the app afterwards in both cases."""
+    if _is_installed():
+        dest = Path(tempfile.gettempdir()) / "M365CopilotProxy-Setup.exe"
+        if not _download(asset_url, dest):
+            return False
+        try:
+            flags = 0x00000008 if os.name == "nt" else 0  # DETACHED_PROCESS — survive our quit
+            subprocess.Popen(
+                [str(dest), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+                creationflags=flags, close_fds=True,
+            )
+        except Exception:
+            return False
+        return True
+
+    # Portable: download the new single-file next to the running exe, then swap-on-exit via a .bat.
     exe = _current_exe()
     if exe is None:
         return False
     new = exe.with_name(exe.stem + ".new.exe")
-    try:
-        with httpx.stream("GET", asset_url, timeout=180, follow_redirects=True) as r:
-            r.raise_for_status()
-            with open(new, "wb") as f:
-                for chunk in r.iter_bytes():
-                    f.write(chunk)
-    except Exception:
+    if not _download(asset_url, new):
         return False
     bat = exe.with_name(exe.stem + ".update.bat")
     pid = os.getpid()
