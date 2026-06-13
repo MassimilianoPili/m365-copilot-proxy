@@ -5,9 +5,9 @@ Connected/Disconnected toggle. Starting/stopping reuses the `serve` internals (t
 auto-refresh, client wiring). With the windowed build there is no console, so stdout/logging is
 redirected into the in-app Logs tab.
 
-Update is opt-in: on launch it checks the GitHub release and, if newer, shows a pop-up; when the
-user accepts it downloads the signed Inno installer and runs it silently, then quits so the
-installer can upgrade the per-user folder in place and relaunch the new build.
+Update is opt-in: on launch it reads the release update.json manifest and, if newer, shows a pop-up.
+On accept, an installed build downloads the signed Inno installer and runs it silently (in-place
+upgrade); a portable single-file swaps itself on restart — the manifest names both URLs explicitly.
 """
 from __future__ import annotations
 
@@ -219,26 +219,24 @@ def _download(url: str, dest: Path) -> bool:
         return False
 
 
+# Stable "latest release" download URL for the update manifest — no GitHub API / asset-name parsing.
+# The manifest carries explicit, named download URLs per build kind:
+#   {"version": "0.2.0", "portable": "<url to portable .exe>", "installer": "<url to Setup .exe>"}
+_UPDATE_MANIFEST_URL = f"https://github.com/{REPO}/releases/latest/download/update.json"
+
+
 def check_update() -> tuple[str, str] | None:
     try:
-        r = httpx.get(
-            f"https://api.github.com/repos/{REPO}/releases/latest",
-            headers={"Accept": "application/vnd.github+json"}, timeout=10, follow_redirects=True,
-        )
+        r = httpx.get(_UPDATE_MANIFEST_URL, timeout=10, follow_redirects=True)
         r.raise_for_status()
-        data = r.json()
-        tag = data.get("tag_name", "")
-        if _version_tuple(tag) <= _version_tuple(APP_VERSION):
+        manifest = r.json()
+        version = str(manifest.get("version", ""))
+        if _version_tuple(version) <= _version_tuple(APP_VERSION):
             return None
-        exes = [a for a in data.get("assets", []) if str(a.get("name", "")).lower().endswith(".exe")]
-        # Installed build -> the Inno "Setup" installer; portable build -> the plain (non-Setup) exe.
-        # Strict per-mode match keeps a portable install portable (never migrate it to installed).
-        if _is_installed():
-            asset = next((a for a in exes if "setup" in str(a.get("name", "")).lower()), None)
-        else:
-            asset = next((a for a in exes if "setup" not in str(a.get("name", "")).lower()), None)
-        if asset:
-            return tag, asset["browser_download_url"]
+        # The running build already knows its kind (install path); pick that key explicitly.
+        url = manifest.get("installer" if _is_installed() else "portable")
+        if url:
+            return version, url
     except Exception:
         return None
     return None
