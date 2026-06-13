@@ -4,7 +4,7 @@
 ; Built by installer_nuitka.ps1 (which compiles the payload, signs it, then runs ISCC).
 
 #define AppName "M365 Copilot Proxy"
-#define AppVersion "0.2.0"
+#define AppVersion "0.3.0"
 #define AppExe "m365-copilot-proxy.exe"
 #define AppPublisher "MassimilianoPili"
 #ifndef PayloadDir

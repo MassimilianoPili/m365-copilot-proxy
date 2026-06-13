@@ -1,6 +1,6 @@
 [project]
 name = "m365-copilot-openai-proxy"
-version = "0.1.0"
+version = "0.3.0"
 description = "OpenAI-compatible shim for Microsoft 365 Copilot Chat"
 license = "Apache-2.0"
 requires-python = ">=3.11"

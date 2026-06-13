@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
-$version = "0.2.0"
+$version = "0.3.0"
 $out     = Join-Path $root "dist-nuitka"
 $distDir = Join-Path $out "build_entry.dist"
 $exe     = Join-Path $distDir "m365-copilot-proxy.exe"
