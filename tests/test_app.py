@@ -396,6 +396,79 @@ def test_persistent_session_turn_flags_are_reserved_in_order() -> None:
     assert second_turn.is_start_of_session is False
 
 
+def test_session_store_evicts_least_recently_used_over_cap() -> None:
+    store = PersistentSessionStore(max_sessions=2)
+    store.get("a")
+    time.sleep(0.01)
+    store.get("b")
+    time.sleep(0.01)
+    store.get("c")  # over cap -> "a" (LRU) evicted
+
+    keys = {k for k, _ in store.items()}
+    assert keys == {"b", "c"}
+
+
+def test_session_store_evicts_sessions_past_ttl() -> None:
+    store = PersistentSessionStore(ttl_seconds=100)
+    stale = store.get("old")
+    stale.last_used = time.time() - 200  # force past the TTL
+    store.get("new")  # any insert triggers the prune
+
+    assert {k for k, _ in store.items()} == {"new"}
+
+
+def test_session_store_does_not_evict_a_leased_session() -> None:
+    import asyncio
+
+    async def scenario() -> None:
+        store = PersistentSessionStore(max_sessions=1)
+        leased = store.get("a")
+        await leased.lock.acquire()  # a concurrent request is mid-turn on "a"
+        try:
+            store.get("b")  # over cap, but "a" is leased -> must survive
+            assert "a" in {k for k, _ in store.items()}
+        finally:
+            leased.lock.release()
+        store.get("c")  # "a" now free -> evictable as LRU
+        assert "a" not in {k for k, _ in store.items()}
+
+    asyncio.run(scenario())
+
+
+def test_persistent_session_rotates_on_truncated_history_edit() -> None:
+    import types
+
+    from m365_copilot_openai_proxy.app import _persistent_session
+
+    store = PersistentSessionStore()
+    app = types.SimpleNamespace(
+        state=types.SimpleNamespace(session_store=store, settings=types.SimpleNamespace(persist_default=True))
+    )
+    req = types.SimpleNamespace(headers={})
+
+    def msg(role: str, text: str):
+        return types.SimpleNamespace(role=role, content=text)
+
+    base = [msg("user", "hello there")]
+    s = _persistent_session(app, req, "m365-copilot", None, base)
+    assert s is not None
+    s.reserve_turn()
+    s.reserve_turn()  # we've served 2 turns on this chat
+    conv = s.conversation_id
+
+    # Faithful continuation: history carries both assistant turns -> keep the conversation.
+    cont = [msg("user", "hello there"), msg("assistant", "a1"),
+            msg("user", "u2"), msg("assistant", "a2"), msg("user", "u3")]
+    s2 = _persistent_session(app, req, "m365-copilot", None, cont)
+    assert s2.conversation_id == conv
+
+    # Truncated/regenerated: only 1 assistant turn left -> rotate to a fresh conversation.
+    trunc = [msg("user", "hello there"), msg("assistant", "a1"), msg("user", "u2b")]
+    s3 = _persistent_session(app, req, "m365-copilot", None, trunc)
+    assert s3.conversation_id != conv
+    assert s3.turn_count == 0
+
+
 def test_openai_streaming_returns_sse() -> None:
     fake = FakeCopilotClient()
     client = build_client(fake)

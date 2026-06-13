@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     # SQLite file for the session/conversation store. Empty -> default under the home dir.
     # Tests point this at a tmp file so they never touch the real store.
     session_db_path: str = Field(default="", alias="M365_SESSION_DB")
+    # Cap on stored conversations: when exceeded, the least-recently-used ones are evicted
+    # (cache + DB) so the store can't grow without bound. 0 -> no cap.
+    session_max: int = Field(default=1000, alias="M365_SESSION_MAX")
+    # Evict conversations unused for this many seconds. 0 -> no TTL (cap-only eviction).
+    session_ttl_seconds: int = Field(default=0, alias="M365_SESSION_TTL")
     # Seconds without any substrate frame before giving up; WS handshake open timeout.
     recv_timeout: int = Field(default=90, alias="M365_RECV_TIMEOUT")
     open_timeout: int = Field(default=30, alias="M365_OPEN_TIMEOUT")

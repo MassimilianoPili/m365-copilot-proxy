@@ -81,7 +81,9 @@ def create_app(
     app.state.token_store = AccessTokenStore(resolved_settings.access_token)
     app.state.session_store = PersistentSessionStore(
         db_path=resolved_settings.session_db_path
-        or str(Path.home() / ".m365-copilot-openai-proxy" / "sessions.db")
+        or str(Path.home() / ".m365-copilot-openai-proxy" / "sessions.db"),
+        max_sessions=resolved_settings.session_max,
+        ttl_seconds=resolved_settings.session_ttl_seconds,
     )
     app.state.copilot_client_factory = copilot_client_factory or (
         lambda: SubstrateCopilotClient(
@@ -446,6 +448,14 @@ def _persistent_session(
     else:
         return None
     session = app.state.session_store.get(key)
+    # Edit/regeneration detection (auto-keyed chats only): a faithful continuation resends every
+    # assistant turn we produced, so the history should carry >= turn_count assistant turns. If it
+    # carries fewer, the client truncated history (edited/regenerated an earlier turn) -> branch
+    # onto a FRESH substrate conversation instead of continuing — and polluting — the old one.
+    if key.startswith("auto:") and session.turn_count > 0 and messages is not None:
+        assistant_turns = sum(1 for m in messages if getattr(m, "role", None) == "assistant")
+        if assistant_turns < session.turn_count:
+            session = app.state.session_store.update(key, rotate=True) or session
     if not session.label and messages:
         session.label = _session_label(messages)
     app.state.session_store.persist(key, session)

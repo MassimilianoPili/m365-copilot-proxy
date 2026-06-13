@@ -41,10 +41,13 @@ class PersistentSessionStore:
     """Maps a key -> PersistentSession. When db_path is given, the conversation mapping is
     persisted to SQLite so chats survive proxy restarts; otherwise it is purely in-memory."""
 
-    def __init__(self, db_path: str | None = None):
+    def __init__(self, db_path: str | None = None, max_sessions: int = 0, ttl_seconds: float = 0.0):
         self._lock = threading.RLock()
         self._cache: dict[str, PersistentSession] = {}
         self._db_path = str(db_path) if db_path else None
+        self._max = max(0, int(max_sessions))
+        self._ttl = max(0.0, float(ttl_seconds))
+        self._last_db_prune = 0.0
         if self._db_path:
             Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
             with sqlite3.connect(self._db_path) as conn:
@@ -63,7 +66,38 @@ class PersistentSessionStore:
             self._cache[key] = session
             if self._db_path:
                 self._save(key, session)
+            self._prune_locked()
             return session
+
+    def _prune_locked(self) -> None:
+        """Bound the store: drop sessions unused past the TTL, then evict the least-recently-used
+        beyond the cap — from both the in-memory cache and (throttled) the SQLite table."""
+        now = time.time()
+        # Never evict a session whose lock is held: a concurrent request is mid-turn on it, and
+        # dropping it here would split that chat onto a fresh substrate conversation.
+        if self._ttl > 0:
+            cutoff = now - self._ttl
+            for k in [k for k, s in self._cache.items() if s.last_used < cutoff and not s.lock.locked()]:
+                self._cache.pop(k, None)
+        if self._max > 0 and len(self._cache) > self._max:
+            evictable = sorted(
+                (kv for kv in self._cache.items() if not kv[1].lock.locked()),
+                key=lambda kv: kv[1].last_used,
+            )
+            for k, _ in evictable[: len(self._cache) - self._max]:
+                self._cache.pop(k, None)
+        # DB rows for keys not in the hot cache can still pile up; prune them on a throttle.
+        if self._db_path and now - self._last_db_prune > 60:
+            self._last_db_prune = now
+            with sqlite3.connect(self._db_path) as conn:
+                if self._ttl > 0:
+                    conn.execute("DELETE FROM sessions WHERE last_used < ?", (now - self._ttl,))
+                if self._max > 0:
+                    conn.execute(
+                        "DELETE FROM sessions WHERE key NOT IN "
+                        "(SELECT key FROM sessions ORDER BY last_used DESC LIMIT ?)",
+                        (self._max,),
+                    )
 
     def persist(self, key: str, session: PersistentSession) -> None:
         if not self._db_path:
@@ -93,6 +127,7 @@ class PersistentSessionStore:
             self._cache[key] = session
             if self._db_path:
                 self._save(key, session)
+            self._prune_locked()
             return session
 
     def update(
