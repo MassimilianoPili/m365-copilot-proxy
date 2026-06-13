@@ -46,6 +46,29 @@ The dedicated Edge profile is stored at:
 
 If startup says it is waiting for a token, click the Copilot message box and type one character. You do not need to send the message.
 
+### Run from source (no .exe)
+
+Use this on machines where the signed release binaries are blocked by Application Control / Smart App Control. Source pulled via `git` carries no Mark-of-the-Web, so the interpreter runs normally.
+
+```powershell
+# clone, then from the repo root:
+powershell -ExecutionPolicy Bypass -File .\run.ps1            # tray GUI (bare invocation)
+powershell -ExecutionPolicy Bypass -File .\run.ps1 serve      # headless API
+```
+
+```bash
+./run.sh            # tray GUI (needs a desktop + python3-tk)
+./run.sh serve      # headless API
+```
+
+The scripts use `uv` when available, otherwise fall back to a local `.venv` + `pip install -e .`. Equivalent one-liners without the scripts:
+
+```bash
+uv run copilot-openai-proxy serve
+# or, without uv (after `pip install -e .`):
+python -m m365_copilot_openai_proxy serve
+```
+
 ## Test It
 
 ```powershell
