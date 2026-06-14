@@ -553,13 +553,28 @@ def _edge_debug_tabs(cdp_port: int) -> list[dict] | None:
         return None
 
 
+async def _cdp_reload_m365(ws_url: str) -> None:
+    """Navigate an already-open debug tab back to the Copilot chat, forcing a fresh page load so a
+    new substrate WebSocket (carrying the access token) is created for capture."""
+    async with websockets.connect(ws_url) as ws:
+        await ws.send(json.dumps({"id": 1, "method": "Page.navigate",
+                                  "params": {"url": "https://m365.cloud.microsoft/chat"}}))
+        await asyncio.wait_for(ws.recv(), timeout=5)
+
+
 def _launch_debug_edge(cdp_port: int) -> None:
-    # Reuse an already-open debug browser: if the M365 page is up on this port, don't spawn a
-    # second process / duplicate tab — just return.
+    # If a debug M365 tab is already open, RELOAD it (don't just skip): an idle reused tab never
+    # opens a fresh substrate WebSocket, so the token capture would stall. Reloading re-triggers it
+    # without opening a duplicate window.
     tabs = _edge_debug_tabs(cdp_port)
-    if tabs is not None and _find_m365_page(tabs):
-        print(f"Edge already open with the M365 page on debug port {cdp_port}; reusing it.")
-        return
+    page = _find_m365_page(tabs) if tabs is not None else None
+    if page is not None and page.get("webSocketDebuggerUrl"):
+        try:
+            asyncio.run(_cdp_reload_m365(page["webSocketDebuggerUrl"]))
+            print(f"Edge already open; reloaded the M365 tab on port {cdp_port} to refresh the substrate token.")
+            return
+        except Exception as exc:
+            print(f"  ! could not reload the existing M365 tab ({exc}); opening a fresh window.")
 
     edge_path = _resolve_debug_browser_path()
     profile_dir = _debug_browser_profile_dir(edge_path)
@@ -576,20 +591,12 @@ def _launch_debug_edge(cdp_port: int) -> None:
         # does not require interactive WAM re-auth. First sign-in must be done non-headless.
         argv += ["--headless=new", "--disable-gpu"]
     argv.append("https://m365.cloud.microsoft/chat")
-    # Detach from this process's job object so Edge survives when the launcher (uv run) exits
-    # or when `serve` is restarted — otherwise the job teardown kills the browser.
-    flags = 0
-    startupinfo = None
-    if os.name == "nt":
-        flags = 0x00000008 | 0x01000000 | 0x00000200  # DETACHED_PROCESS | BREAKAWAY_FROM_JOB | NEW_PROCESS_GROUP
-        if not headless:
-            # Start the Edge window minimized so it doesn't steal focus on every serve start.
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = 6  # SW_SHOWMINIMIZED
-    subprocess.Popen(argv, creationflags=flags, startupinfo=startupinfo, close_fds=True)
-    where = "headless" if headless else "minimized"
-    print(f"Edge launched ({where}) with remote debugging on port {cdp_port}.")
+    # Detach from this process's job object so Edge survives when the launcher exits / serve restarts.
+    # NOTE: launched VISIBLE (not minimized) — the substrate token is captured from the page's
+    # WebSocket, which only opens when the chat actually loads/interacts, so the window must be usable.
+    flags = 0x00000008 | 0x01000000 | 0x00000200 if os.name == "nt" else 0
+    subprocess.Popen(argv, creationflags=flags, close_fds=True)
+    print(f"Edge launched ({'headless' if headless else 'visible'}) with remote debugging on port {cdp_port}.")
     print(f"Dedicated Edge profile: {profile_dir}")
     print("Sign in to M365 Copilot in that window once, then retry refresh.")
 

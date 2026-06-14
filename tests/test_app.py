@@ -469,6 +469,127 @@ def test_persistent_session_rotates_on_truncated_history_edit() -> None:
     assert s3.turn_count == 0
 
 
+def test_is_proxy_model_classifies_ours_vs_passthrough() -> None:
+    from m365_copilot_openai_proxy.app import _is_proxy_model
+
+    s = Settings(M365_MODEL_ALIAS="m365-copilot")
+    assert _is_proxy_model(s, "m365-opus")
+    assert _is_proxy_model(s, "m365-gpt:persist")
+    assert _is_proxy_model(s, "m365-copilot")
+    assert _is_proxy_model(s, "")  # no model -> keep substrate default
+    assert not _is_proxy_model(s, "claude-sonnet-4-6")
+    assert not _is_proxy_model(s, "gpt-4o")
+
+
+def test_anthropic_messages_passthrough_only_for_non_m365_models(monkeypatch) -> None:
+    from fastapi.responses import JSONResponse
+
+    from m365_copilot_openai_proxy import anthropic_passthrough as ap
+    from m365_copilot_openai_proxy.app import create_app
+
+    monkeypatch.setattr(ap, "credential_available", lambda settings: True)
+
+    async def fake_forward(settings, body, headers):
+        return JSONResponse({"forwarded": True})
+
+    monkeypatch.setattr(ap, "forward_messages", fake_forward)
+
+    settings = Settings(M365_ACCESS_TOKEN="fake-token", M365_PERSIST_DEFAULT=False, M365_ANTHROPIC_PASSTHROUGH=True)
+    fake = FakeCopilotClient()
+    client = TestClient(create_app(settings=settings, copilot_client_factory=lambda: fake))
+
+    body = {"max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}
+
+    # Non-m365 model -> forwarded to Anthropic, substrate untouched.
+    r = client.post("/v1/messages", json={**body, "model": "claude-sonnet-4-6"})
+    assert r.json() == {"forwarded": True}
+    assert fake.calls == []
+
+    # Our model -> substrate, NOT forwarded.
+    r2 = client.post("/v1/messages", json={**body, "model": "m365-opus"})
+    assert r2.status_code == 200
+    assert fake.calls
+
+
+def test_passthrough_headers_oauth_and_apikey(tmp_path) -> None:
+    from m365_copilot_openai_proxy import anthropic_passthrough as ap
+
+    creds = tmp_path / ".credentials.json"
+    creds.write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "tok-abc", "refreshToken": "r", "expiresAt": 9_999_999_999_000}}),
+        encoding="utf-8",
+    )
+
+    class S:
+        anthropic_version = "2023-06-01"
+        anthropic_creds_file = str(creds)
+        anthropic_key = ""
+
+    class H:
+        def __init__(self, d):
+            self._d = d
+
+        def get(self, k):
+            return self._d.get(k)
+
+    # OAuth mode: Bearer + the required oauth-2025-04-20 beta flag, no x-api-key.
+    h = ap._upstream_headers(S(), H({}))
+    assert h["Authorization"] == "Bearer tok-abc"
+    assert "oauth-2025-04-20" in h["anthropic-beta"]
+    assert "x-api-key" not in h
+    assert ap.credential_available(S())
+
+    # A client-supplied beta is preserved and merged with the oauth flag.
+    h2 = ap._upstream_headers(S(), H({"anthropic-beta": "foo"}))
+    assert h2["anthropic-beta"] == "foo,oauth-2025-04-20"
+
+    # API-key override -> x-api-key, no Authorization/oauth beta.
+    class SK(S):
+        anthropic_key = "sk-test-1234"
+
+    h3 = ap._upstream_headers(SK(), H({}))
+    assert h3["x-api-key"] == "sk-test-1234"
+    assert "Authorization" not in h3
+    assert "anthropic-beta" not in h3
+
+
+def test_launch_debug_edge_reloads_existing_tab(monkeypatch) -> None:
+    from m365_copilot_openai_proxy import cli
+
+    calls = {"reload": 0, "popen": 0}
+    monkeypatch.setattr(cli, "_edge_debug_tabs", lambda port: [
+        {"type": "page", "url": "https://m365.cloud.microsoft/chat", "webSocketDebuggerUrl": "ws://debug"}
+    ])
+
+    async def fake_reload(ws_url):
+        calls["reload"] += 1
+
+    monkeypatch.setattr(cli, "_cdp_reload_m365", fake_reload)
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: calls.__setitem__("popen", calls["popen"] + 1))
+
+    cli._launch_debug_edge(9222)
+
+    assert calls == {"reload": 1, "popen": 0}  # reused + reloaded, no duplicate window spawned
+
+
+def test_launch_debug_edge_spawns_visible_when_no_tab(monkeypatch, tmp_path) -> None:
+    from m365_copilot_openai_proxy import cli
+
+    popen_calls: list[tuple] = []
+    monkeypatch.setattr(cli, "_edge_debug_tabs", lambda port: None)
+    monkeypatch.setattr(cli, "_resolve_debug_browser_path", lambda: str(tmp_path / "edge.exe"))
+    monkeypatch.setattr(cli, "_debug_browser_profile_dir", lambda p: tmp_path / "profile")
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: popen_calls.append((a, k)))
+    monkeypatch.delenv("M365_EDGE_HEADLESS", raising=False)
+
+    cli._launch_debug_edge(9222)
+
+    assert len(popen_calls) == 1
+    (argv,), kwargs = popen_calls[0]
+    assert argv[-1] == "https://m365.cloud.microsoft/chat"
+    assert kwargs.get("startupinfo") is None  # launched VISIBLE, not minimized
+
+
 def test_openai_streaming_returns_sse() -> None:
     fake = FakeCopilotClient()
     client = build_client(fake)

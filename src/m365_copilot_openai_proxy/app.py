@@ -57,6 +57,14 @@ _PERSIST_MODEL_SUFFIX = ":persist"
 _SESSION_ID_HEADER = "x-m365-session-id"
 
 
+def _is_proxy_model(settings: Settings, model: str | None) -> bool:
+    """True if the model is one of ours (route to substrate); False -> passthrough candidate."""
+    base = (model or "").split(":", 1)[0].strip().lower()
+    if not base:
+        return True  # no model -> keep current substrate default
+    return base == settings.model_alias.lower() or base in MODEL_TO_TONE or base.startswith("m365")
+
+
 def create_app(
     settings: Settings | None = None,
     copilot_client_factory: Callable[[], SubstrateCopilotClient] | None = None,
@@ -104,6 +112,11 @@ def create_app(
             return app.state.copilot_client_factory()
         except SubstrateCopilotError as exc:
             # e.g. token missing/expired: surface a clean 502, not an unhandled 500.
+            try:
+                status = app.state.token_store.status()
+            except Exception:
+                status = "?"
+            print(f"[502] substrate client unavailable: {exc} | token={status}")
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/healthz", tags=["ops"])
@@ -169,6 +182,7 @@ def create_app(
         settings: Settings = Depends(get_settings),
         client: SubstrateCopilotClient = Depends(get_copilot_client),
     ):
+        print(f"-> /v1/chat/completions model={request.model!r} stream={request.stream} tools={bool(request.tools)}")
         try:
             await _debug_raw(raw_request)
             translated = translate_openai_request(request)
@@ -206,8 +220,10 @@ def create_app(
             else:
                 calls, text = None, await client.chat(prompt, ctx, session, tone, images)
         except ValueError as exc:
+            print(f"[400] bad request: {exc}")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except SubstrateCopilotError as exc:
+            print(f"[502] substrate error: {exc}")
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         if calls:
@@ -288,8 +304,20 @@ def create_app(
         raw_request: Request,
         request: AnthropicMessagesRequest,
         settings: Settings = Depends(get_settings),
-        client: SubstrateCopilotClient = Depends(get_copilot_client),
     ):
+        # Passthrough: a model that isn't ours -> forward verbatim to the real Anthropic API.
+        # Checked BEFORE resolving the substrate client, so an expired substrate token (they last
+        # ~1h) never blocks passthrough.
+        ours = _is_proxy_model(settings, request.model)
+        print(f"-> /v1/messages model={request.model!r} stream={getattr(request, 'stream', False)} "
+              f"route={'substrate' if ours else 'passthrough'} passthrough_enabled={settings.anthropic_passthrough}")
+        if settings.anthropic_passthrough and not ours:
+            from .anthropic_passthrough import credential_available, forward_messages
+
+            if credential_available(settings):
+                return await forward_messages(settings, await raw_request.body(), raw_request.headers)
+            print("  ! passthrough requested but no Anthropic credential available -> using substrate")
+        client = get_copilot_client()
         try:
             translated = translate_anthropic_request(request)
             session = _persistent_session(app, raw_request, request.model, None, request.messages)
@@ -321,8 +349,10 @@ def create_app(
             else:
                 calls, text = None, await client.chat(prompt, ctx, session, tone, images)
         except ValueError as exc:
+            print(f"[400] bad request: {exc}")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except SubstrateCopilotError as exc:
+            print(f"[502] substrate error: {exc}")
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         if calls:
