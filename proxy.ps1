@@ -24,8 +24,9 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-$port = 8000
-$exe  = Join-Path $PSScriptRoot "dist\m365-copilot-proxy.exe"
+$port    = 8000
+$exeRel  = "dist\m365-copilot-proxy.exe"
+$exe     = Join-Path $PSScriptRoot $exeRel
 
 # --- 1. detect listener on :PORT ---------------------------------------------
 $active = $false
@@ -60,16 +61,16 @@ if (-not (Test-Path .venv)) {
 # 3b. ensure exe (or force rebuild)
 if ((-not (Test-Path $exe)) -or $ForceBuild) {
     if ($ForceBuild) {
-        Write-Host "  -ForceBuild specified - rebuilding $exe ..." -ForegroundColor Cyan
+        Write-Host "  -ForceBuild specified - rebuilding $exeRel ..." -ForegroundColor Cyan
     } else {
-        Write-Host "  $exe missing - building (PyInstaller, ~1-2 min)..." -ForegroundColor Cyan
+        Write-Host "  $exeRel missing - building (PyInstaller, ~1-2 min)..." -ForegroundColor Cyan
     }
-    & "$PSScriptRoot\build-exe.ps1"
-    if (-not (Test-Path $exe)) { throw "build failed: $exe not found" }
+    & ".\build-exe.ps1"
+    if (-not (Test-Path $exe)) { throw "build failed: $exeRel not found" }
 }
 
 # 3c. start the locally-built signed exe headless, windowless (no MotW -> no SmartScreen prompt)
-Write-Host "[M365 Proxy] starting $exe serve ..." -ForegroundColor Cyan
+Write-Host "[M365 Proxy] starting $exeRel serve ..." -ForegroundColor Cyan
 $env:M365_TIME_ZONE     = "Europe/Rome"
 $env:M365_WORK_GROUNDING = "false"
 $env:M365_DEBUG          = "1"
