@@ -47,7 +47,11 @@ _DEFAULT_SETTINGS = {
     "configure_clients": True,   # wire Claude Code + VS Code while running
     "launch_edge": True,         # open the debug Edge window for token capture/refresh
     "auto_refresh": True,
-    "auto_connect": True,        # connect the proxy automatically when the app launches
+    "auto_connect": False,       # do NOT connect automatically on launch (user connects explicitly)
+    "persist_default": True,     # reuse one substrate conversation per client chat
+    "ws_reuse": False,           # keep one WebSocket alive per session (experimental)
+    "passthrough_claude": True,  # forward non-m365 models straight to the real Anthropic API
+    "anthropic_key": "",         # optional API-key override for passthrough (empty -> OAuth file)
 }
 
 
@@ -81,6 +85,18 @@ def save_settings(s: dict) -> None:
         _GUI_SETTINGS.write_text(json.dumps(s, indent=2), encoding="utf-8")
     except Exception as exc:
         print(f"  ! could not save settings: {exc}")
+
+
+def _tray_image(connected: bool):
+    """The tray icon with a green (connected) / red (disconnected) status badge in the corner."""
+    from PIL import Image, ImageDraw
+
+    base = Image.open(_pkg_file("icon.png")).convert("RGBA").resize((64, 64))
+    draw = ImageDraw.Draw(base)
+    r = 24
+    color = (46, 204, 113, 255) if connected else (231, 76, 60, 255)
+    draw.ellipse([64 - r, 64 - r, 63, 63], fill=color, outline=(22, 22, 26, 255), width=3)
+    return base
 
 
 # --- proxy lifecycle ---------------------------------------------------------------------------
@@ -124,6 +140,14 @@ class ProxyController:
             s = self.settings
             os.environ["M365_WORK_GROUNDING"] = "true" if s.get("work_grounding") else "false"
             os.environ["M365_DISABLE_MEMORY"] = "true" if s.get("temporary_chat", True) else "false"
+            os.environ["M365_PERSIST_DEFAULT"] = "true" if s.get("persist_default", True) else "false"
+            os.environ["M365_WS_REUSE"] = "true" if s.get("ws_reuse", False) else "false"
+            os.environ["M365_ANTHROPIC_PASSTHROUGH"] = "true" if s.get("passthrough_claude", False) else "false"
+            override_key = (s.get("anthropic_key") or "").strip()
+            if override_key:
+                os.environ["M365_ANTHROPIC_KEY"] = override_key
+            else:
+                os.environ.pop("M365_ANTHROPIC_KEY", None)  # empty -> use the Claude Code OAuth file
             self.port = int(s.get("port", 8000))
 
             print(f"Starting proxy on {self.base_url} ...")
@@ -173,6 +197,12 @@ class ProxyController:
                 _configure_clients(undo=True, base_url=self.base_url)
             self._running = False
             print("Proxy stopped.")
+
+    def reconnect(self) -> None:
+        """Stop then start, so edited settings/env take effect without a manual disconnect+connect."""
+        print("Reloading proxy connection ...")
+        self.stop()
+        self.start()
 
     def token_info(self) -> str:
         from .cli import _is_substrate_token, _read_token, _seconds_remaining
@@ -326,8 +356,42 @@ class _GuiLog:
 
 # --- GUI ---------------------------------------------------------------------------------------
 
+_singleton_handle = None
+
+
+def _acquire_singleton() -> bool:
+    """Single-instance guard (cross-platform): False if another tray instance already holds it.
+    The handle is kept on a module global so the OS releases it only when this process exits."""
+    global _singleton_handle
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            _singleton_handle = ctypes.windll.kernel32.CreateMutexW(None, False, "M365CopilotProxy.singleton")
+            return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+        except Exception:
+            return True
+    # POSIX: a non-blocking exclusive flock on a per-user lock file, held for the process lifetime.
+    try:
+        import fcntl
+
+        lock = Path.home() / ".m365-copilot-openai-proxy" / "tray.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        f = open(lock, "w")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _singleton_handle = f  # keep the fd open so the lock survives
+        return True
+    except OSError:
+        return False  # already locked by another instance
+    except Exception:
+        return True
+
+
 def run_tray() -> None:
     _hide_console()
+    if not _acquire_singleton():
+        print("M365 Copilot Proxy is already running; exiting this instance.")
+        return
     import customtkinter as ctk
     import pystray
     from PIL import Image
@@ -365,6 +429,7 @@ def run_tray() -> None:
     t_status = tabs.add("Status")
     t_logs = tabs.add("Logs")
     t_settings = tabs.add("Settings")
+    t_passthrough = tabs.add("Passthrough")
 
     # ---- Status tab ----
     dot = ctk.CTkFrame(t_status, width=16, height=16, corner_radius=8, fg_color=MUTED)
@@ -396,6 +461,10 @@ def run_tray() -> None:
                                font=ctk.CTkFont(size=12, weight="bold"), fg_color=GREEN, hover_color="#3CB179")
     pending_update: dict[str, str] = {}
 
+    # Reload = reconnect the proxy (apply edited settings). Shown only while connected (in refresh()).
+    reload_btn = ctk.CTkButton(t_status, text="↻ Reload (reconnect)", height=34, corner_radius=17,
+                               font=ctk.CTkFont(size=12, weight="bold"), fg_color=CARD, hover_color="#2A2A33")
+
     toggle_btn = ctk.CTkButton(t_status, text="Connect", height=46, corner_radius=23,
                                font=ctk.CTkFont(size=15, weight="bold"), fg_color=ACCENT, hover_color=ACCENT_HOVER)
     toggle_btn.pack(padx=18, pady=(22, 8), fill="x", side="bottom")
@@ -420,20 +489,47 @@ def run_tray() -> None:
     ctk.CTkEntry(pr, textvariable=port_var, width=90).pack(side="right")
     vars_["port"] = port_var
 
-    def _switch(key: str, label: str):
-        row = ctk.CTkFrame(sform, fg_color="transparent"); row.pack(fill="x", pady=6)
+    def _switch(parent, key: str, label: str):
+        row = ctk.CTkFrame(parent, fg_color="transparent"); row.pack(fill="x", pady=6)
         ctk.CTkLabel(row, text=label, font=ctk.CTkFont(size=12), text_color=TEXT).pack(side="left")
         sw = ctk.CTkSwitch(row, text="", progress_color=ACCENT)
         sw.pack(side="right")
         sw.select() if settings.get(key) else sw.deselect()
         vars_[key] = sw
 
-    _switch("auto_connect", "Auto-connect on launch")
-    _switch("temporary_chat", "Temporary chat (no history)")
-    _switch("work_grounding", "Work grounding (enterprise)")
-    _switch("configure_clients", "Auto-configure Claude Code + VS Code")
-    _switch("launch_edge", "Open debug Edge for token")
-    _switch("auto_refresh", "Auto-refresh token")
+    _switch(sform, "auto_connect", "Auto-connect on launch")
+    _switch(sform, "temporary_chat", "Temporary chat (no history)")
+    _switch(sform, "work_grounding", "Work grounding (enterprise)")
+    _switch(sform, "configure_clients", "Auto-configure Claude Code + VS Code")
+    _switch(sform, "launch_edge", "Open debug Edge for token")
+    _switch(sform, "auto_refresh", "Auto-refresh token")
+    _switch(sform, "persist_default", "Reuse one conversation per chat")
+    _switch(sform, "ws_reuse", "Keep WebSocket alive (experimental)")
+
+    def reconnect_async():
+        if controller.running:
+            threading.Thread(target=controller.reconnect, daemon=True).start()
+
+    reload_btn.configure(command=reconnect_async)
+
+    # Manual client wiring (Claude Code global env + VS Code custom model): apply / remove on demand.
+    cfg_row = ctk.CTkFrame(sform, fg_color="transparent"); cfg_row.pack(fill="x", pady=(14, 6))
+    ctk.CTkLabel(cfg_row, text="Global client config", font=ctk.CTkFont(size=12), text_color=TEXT).pack(side="left")
+
+    def _client_config(undo: bool):
+        from .cli import _configure_clients
+
+        def work():
+            try:
+                _configure_clients(undo=undo, base_url=controller.base_url)
+            except Exception as exc:
+                print(f"  ! client config {'remove' if undo else 'apply'} failed: {exc}")
+        threading.Thread(target=work, daemon=True).start()
+
+    ctk.CTkButton(cfg_row, text="Remove", width=72, height=28, corner_radius=14, fg_color="#2A2A33",
+                  hover_color=RED, command=lambda: _client_config(True)).pack(side="right", padx=(6, 0))
+    ctk.CTkButton(cfg_row, text="Apply", width=72, height=28, corner_radius=14, fg_color=ACCENT,
+                  hover_color=ACCENT_HOVER, command=lambda: _client_config(False)).pack(side="right")
 
     save_hint = ctk.CTkLabel(t_settings, text="", font=ctk.CTkFont(size=11), text_color=GREEN)
     save_hint.pack()
@@ -443,14 +539,108 @@ def run_tray() -> None:
             settings["port"] = int(port_var.get())
         except ValueError:
             pass
-        for key in ("auto_connect", "temporary_chat", "work_grounding", "configure_clients", "launch_edge", "auto_refresh"):
+        for key in ("auto_connect", "temporary_chat", "work_grounding", "configure_clients",
+                    "launch_edge", "auto_refresh", "persist_default", "ws_reuse"):
             settings[key] = bool(vars_[key].get())  # type: ignore[attr-defined]
         save_settings(settings)
-        save_hint.configure(text="Saved. Reconnect to apply.")
+        if controller.running:
+            save_hint.configure(text="Saved — reconnecting…")
+            reconnect_async()
+        else:
+            save_hint.configure(text="Saved.")
         app.after(2500, lambda: save_hint.configure(text=""))
 
     ctk.CTkButton(t_settings, text="Save", height=36, corner_radius=18, fg_color=ACCENT,
                   hover_color=ACCENT_HOVER, command=save_clicked).pack(padx=8, pady=8, fill="x", side="bottom")
+
+    # ---- Passthrough tab ----
+    pform = ctk.CTkFrame(t_passthrough, fg_color="transparent")
+    pform.pack(fill="both", expand=True, padx=10, pady=10)
+    ctk.CTkLabel(
+        pform,
+        text="Models that aren't ours (non m365-*) are forwarded straight to the real Anthropic\n"
+             "API. Default credential = your Claude Code login (free, uses your subscription).",
+        font=ctk.CTkFont(size=11), text_color=MUTED, justify="left", wraplength=360,
+    ).pack(anchor="w", pady=(0, 10))
+    _switch(pform, "passthrough_claude", "Forward non-m365 models to Claude")
+
+    # The Claude Code login file is the single source of truth for the passthrough token.
+    _creds_file = Path.home() / ".claude" / ".credentials.json"
+
+    def _read_creds() -> dict:
+        try:
+            return json.loads(_creds_file.read_text("utf-8"))
+        except Exception:
+            return {}
+
+    def _oauth_status() -> str:
+        oauth = _read_creds().get("claudeAiOauth", {})
+        if not oauth.get("accessToken"):
+            return "Claude Code OAuth: no token in ~/.claude/.credentials.json"
+        exp = int(oauth.get("expiresAt") or 0)
+        if exp:
+            left = int((exp / 1000 - time.time()) / 60)
+            return f"Claude Code OAuth: valid ({left}m left)" if left > 0 else "Claude Code OAuth: expired (auto-refresh on use)"
+        return "Claude Code OAuth: valid"
+
+    cred_hint = ctk.CTkLabel(pform, text=_oauth_status(), font=ctk.CTkFont(size=11), text_color=GREEN,
+                             justify="left", wraplength=360)
+    cred_hint.pack(anchor="w", pady=(8, 4))
+
+    # Single token field: shows the token from the JSON; editing + Apply overwrites the JSON.
+    hdr = ctk.CTkFrame(pform, fg_color="transparent"); hdr.pack(fill="x", pady=(12, 2))
+    ctk.CTkLabel(hdr, text="Token (source: ~/.claude/.credentials.json)", font=ctk.CTkFont(size=12),
+                 text_color=TEXT).pack(side="left")
+    _reveal = [False]
+
+    def _toggle_reveal():
+        _reveal[0] = not _reveal[0]
+        tok_entry.configure(show="" if _reveal[0] else "•")
+        reveal_btn.configure(text="Hide" if _reveal[0] else "Show")
+
+    def _copy_token():
+        t = (tok_var.get() or "").strip()
+        if t:
+            app.clipboard_clear()
+            app.clipboard_append(t)
+
+    reveal_btn = ctk.CTkButton(hdr, text="Show", width=58, height=24, corner_radius=12,
+                               fg_color=CARD, hover_color="#2A2A33", command=_toggle_reveal)
+    reveal_btn.pack(side="right")
+    ctk.CTkButton(hdr, text="Copy", width=58, height=24, corner_radius=12,
+                  fg_color=CARD, hover_color="#2A2A33", command=_copy_token).pack(side="right", padx=(0, 6))
+    tok_var = ctk.StringVar(value=(_read_creds().get("claudeAiOauth", {}).get("accessToken", "") or ""))
+    tok_entry = ctk.CTkEntry(pform, textvariable=tok_var, show="•")
+    tok_entry.pack(fill="x")
+
+    pt_hint = ctk.CTkLabel(pform, text="", font=ctk.CTkFont(size=11), text_color=GREEN, justify="left", wraplength=360)
+    pt_hint.pack(anchor="w", pady=(6, 0))
+
+    def save_passthrough():
+        settings["passthrough_claude"] = bool(vars_["passthrough_claude"].get())  # type: ignore[attr-defined]
+        save_settings(settings)
+        # Write the (possibly edited) token back to the JSON — the source of truth — preserving siblings.
+        new_tok = (tok_var.get() or "").strip()
+        raw = _read_creds()
+        cur = (raw.get("claudeAiOauth") or {}).get("accessToken", "")
+        msg = "Saved."
+        if new_tok and new_tok != cur:
+            oauth = raw.get("claudeAiOauth") or {}
+            oauth["accessToken"] = new_tok
+            raw["claudeAiOauth"] = oauth
+            try:
+                _creds_file.write_text(json.dumps(raw), "utf-8")
+                msg = "✓ token written to ~/.claude/.credentials.json"
+            except Exception as exc:
+                msg = f"! could not write token: {exc}"
+        if controller.running:
+            reconnect_async()
+        cred_hint.configure(text=_oauth_status())
+        pt_hint.configure(text=msg)
+        app.after(3000, lambda: pt_hint.configure(text=""))
+
+    ctk.CTkButton(t_passthrough, text="Apply", height=36, corner_radius=18, fg_color=ACCENT,
+                  hover_color=ACCENT_HOVER, command=save_passthrough).pack(padx=8, pady=8, fill="x", side="bottom")
 
     footer = ctk.CTkFrame(app, fg_color="transparent")
     footer.pack(side="bottom", fill="x", padx=16, pady=(0, 10))
@@ -461,6 +651,8 @@ def run_tray() -> None:
     quit_button.pack(side="right")
 
     # --- behaviour ---
+    _tray_state: list[object] = [None]  # last status pushed to the tray badge (avoid redundant redraws)
+
     def refresh():
         on = controller.running
         dot.configure(fg_color=GREEN if on else MUTED)
@@ -472,10 +664,21 @@ def run_tray() -> None:
             text="↻ Reload VS Code (Ctrl+Shift+P → Reload Window) to load the M365 model"
             if on and settings.get("configure_clients", True) else ""
         )
+        if on:
+            reload_btn.pack(padx=18, pady=(0, 4), fill="x", side="bottom", before=toggle_btn)
+        else:
+            reload_btn.pack_forget()
         toggle_btn.configure(text="Disconnect" if on else "Connect",
                              fg_color=RED if on else ACCENT, hover_color=RED_HOVER if on else ACCENT_HOVER)
         try:
             icon.title = f"M365 Copilot Proxy - {'Connected' if on else 'Disconnected'}"
+            if _tray_state[0] != on:
+                _tray_state[0] = on
+                icon.icon = _tray_image(on)  # green/red status badge on the tray icon
+        except Exception:
+            pass
+        try:  # keep the passthrough OAuth status live
+            cred_hint.configure(text=_oauth_status())
         except Exception:
             pass
         app.after(1500, refresh)
@@ -530,7 +733,7 @@ def run_tray() -> None:
     root_logger.setLevel(logging.INFO)
 
     # --- tray ---
-    tray_image = Image.open(_pkg_file("icon.png"))
+    tray_image = _tray_image(controller.running)
 
     def quit_app(*_):
         try:
@@ -565,7 +768,22 @@ def run_tray() -> None:
     threading.Thread(target=update_check_async, daemon=True).start()
 
     refresh()
+    # Best-effort cleanup (undo client wiring + stop the server) on ANY interpreter exit —
+    # normal quit, unhandled exception, or sys.exit. Cannot catch SIGKILL / taskkill /F.
+    import atexit
+
+    def _cleanup_on_exit():
+        try:
+            if controller.running:
+                controller.stop()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup_on_exit)
     try:
         app.mainloop()
     except KeyboardInterrupt:
         quit_app()
+    except BaseException:
+        _cleanup_on_exit()  # crash in the GUI loop: still undo before propagating
+        raise

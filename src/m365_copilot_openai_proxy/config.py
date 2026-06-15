@@ -43,3 +43,13 @@ class Settings(BaseSettings):
         default=r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         alias="M365_EDGE_PATH",
     )
+    # Passthrough: models NOT recognized as ours (m365-*) are forwarded to the real Anthropic API
+    # on /v1/messages, instead of being routed to substrate. Off by default.
+    anthropic_passthrough: bool = Field(default=False, alias="M365_ANTHROPIC_PASSTHROUGH")
+    anthropic_upstream: str = Field(default="https://api.anthropic.com", alias="M365_ANTHROPIC_UPSTREAM")
+    anthropic_version: str = Field(default="2023-06-01", alias="M365_ANTHROPIC_VERSION")
+    # OAuth credential source (default): the Claude Code login file. Free (uses the subscription).
+    anthropic_creds_file: str = Field(default="", alias="M365_ANTHROPIC_CREDS")
+    # API-key override: if set, passthrough uses x-api-key with this key (consumes API credits)
+    # instead of the OAuth subscription token.
+    anthropic_key: str = Field(default="", alias="M365_ANTHROPIC_KEY")
