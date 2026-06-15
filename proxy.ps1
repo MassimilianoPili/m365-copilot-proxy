@@ -14,7 +14,8 @@
 #   detects listener on :8000 and stops every m365-copilot-openai-proxy process
 #   (same kill-by-image-path used in the old proxy-toggle.bat).
 #
-# Source-only run (no exe at all, useful on dev / Linux): use run.ps1 instead.
+# macOS / Linux counterpart: proxy.sh (runs from source, no PyInstaller step).
+# Foreground source run (no exe at all, useful on dev): use run.ps1 / run.sh instead.
 
 [CmdletBinding()]
 param(
