@@ -69,6 +69,25 @@ uv run copilot-openai-proxy serve
 python -m m365_copilot_openai_proxy serve
 ```
 
+### Build and run locally (Windows)
+
+A locally-built `.exe` has no Mark-of-the-Web, so SmartScreen will not warn on it (unlike the binary downloaded from GitHub releases). The self-signed Authenticode signature is enough for corporate Application Control (WDAC) on this machine.
+
+| Script | Purpose |
+|---|---|
+| `proxy.ps1` *(recommended)* | One unified command: toggle on/off, build the standalone exe if missing, then start it headless. `.\proxy.ps1` toggles, `.\proxy.ps1 -ForceBuild` rebuilds first. |
+| `proxy-toggle.bat` | Simple toggle on/off of the venv console script. No build step — assumes `.venv` is already set up. |
+| `build-exe.ps1` | Explicit PyInstaller build of `dist\m365-copilot-proxy.exe`, self-signed. Called automatically by `proxy.ps1` when the exe is missing. |
+| `run.ps1` / `run.sh` | Run from source (no exe), for dev or Linux. |
+
+```powershell
+# first time and every subsequent toggle:
+powershell -ExecutionPolicy Bypass -File .\proxy.ps1
+
+# force a rebuild (e.g. after pulling new code):
+powershell -ExecutionPolicy Bypass -File .\proxy.ps1 -ForceBuild
+```
+
 ## Test It
 
 ```powershell
