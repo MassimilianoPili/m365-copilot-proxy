@@ -69,6 +69,31 @@ uv run copilot-openai-proxy serve
 python -m m365_copilot_openai_proxy serve
 ```
 
+### Build / toggle scripts
+
+One unified command per platform that toggles the proxy on/off and ensures
+the runtime is in place before the first start.
+
+| Script | OS | Purpose |
+|---|---|---|
+| `proxy.ps1` *(recommended on Windows)* | Windows | Toggle on/off; build the standalone exe if missing, then start it headless. `.\proxy.ps1` toggles, `.\proxy.ps1 -ForceBuild` rebuilds first. Locally built → no Mark-of-the-Web → no SmartScreen prompt. |
+| `proxy.sh` *(recommended on macOS / Linux)* | macOS / Linux | Toggle on/off; create the `.venv` + editable install on first start, then run headless from source in background. `./proxy.sh --reinstall` forces a fresh `pip install -e .`. |
+| `proxy-toggle.bat` | Windows | Simple toggle on/off of the venv console script. No build step — assumes `.venv` is already set up. |
+| `build-exe.ps1` | Windows | Explicit PyInstaller build of `dist\m365-copilot-proxy.exe`, self-signed. Called automatically by `proxy.ps1` when the exe is missing. |
+| `run.ps1` / `run.sh` | All | Foreground run from source (tray GUI or `serve`). Use these for dev, not for "fire and forget". |
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -File .\proxy.ps1              # toggle
+powershell -ExecutionPolicy Bypass -File .\proxy.ps1 -ForceBuild  # rebuild + start
+```
+
+```bash
+# macOS / Linux
+./proxy.sh              # toggle
+./proxy.sh --reinstall  # refresh editable install + start
+```
+
 ## Test It
 
 ```powershell
