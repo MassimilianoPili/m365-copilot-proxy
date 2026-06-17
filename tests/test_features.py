@@ -221,6 +221,26 @@ def test_trim_history_drops_transcript_after_first_turn() -> None:
     assert trimmed == ["System instructions:\nbe nice"]  # transcript dropped
 
 
+def test_trim_history_preserves_tool_results() -> None:
+    """Tool results must be preserved even when transcript is trimmed."""
+    ctx = [
+        "System instructions:\nbe nice",
+        "Prior conversation transcript:\nUser: read file\nAssistant (tool call): read({})",
+        "Tool results:\nTool result [call_123]: <content>Hello, world!</content>",
+    ]
+    fresh = PersistentSession()  # turn_count 0
+    assert _trim_history(list(ctx), fresh) == ctx  # first turn keeps everything
+    continued = PersistentSession()
+    continued.turn_count = 3
+    trimmed = _trim_history(list(ctx), continued)
+    # System instructions and Tool results kept, transcript dropped
+    assert "System instructions:\nbe nice" in trimmed
+    assert any("Tool result [call_123]" in t for t in trimmed), (
+        "Tool results must be preserved"
+    )
+    assert not any("Prior conversation transcript:" in t for t in trimmed)
+
+
 def test_combine_text_leads_with_prompt() -> None:
     out = _combine_text("THE REAL MESSAGE", ["big reference context"])
     assert out.startswith("THE REAL MESSAGE")

@@ -3,12 +3,17 @@ import logging
 import hashlib
 import re
 import uuid
+from pathlib import Path
 from typing import Any, Tuple
 
 from ..config import Settings
 from ..models import OpenAIChatRequest, ToolCall, FunctionCall
 
 logger = logging.getLogger(__name__)
+
+FILE_TOOLS_WITH_FILEPATH = frozenset({"read"})
+
+FILE_TOOLS_WITH_PATH = frozenset({"write", "edit", "glob", "list", "search", "bash"})
 
 
 class ToolEmulationPipeline:
@@ -31,7 +36,9 @@ class ToolEmulationPipeline:
         if self.settings.tool_emulation_native_passthrough:
             # If native passthrough is enabled, check if we know it's native.
             # If it's a known non-m365/copilot model, it may be native.
-            is_ours = request.model.startswith("m365-") or request.model.startswith("copilot")
+            is_ours = request.model.startswith("m365-") or request.model.startswith(
+                "copilot"
+            )
             if not is_ours:
                 if not self.settings.tool_emulation_emulate_when_capability_unknown:
                     return False
@@ -46,7 +53,9 @@ class ToolEmulationPipeline:
         Returns (mutated_request, tools_prompt, normalized_tools).
         """
         if self.settings.tool_emulation_mode not in ("response_only",):
-            raise NotImplementedError(f"Tool emulation mode {self.settings.tool_emulation_mode!r} is not supported.")
+            raise NotImplementedError(
+                f"Tool emulation mode {self.settings.tool_emulation_mode!r} is not supported."
+            )
 
         normalized_tools = self._normalize_tools(request)
 
@@ -106,6 +115,17 @@ class ToolEmulationPipeline:
     def _reduce_tools(
         self, tools: list[dict[str, Any]], tool_choice: Any, request: OpenAIChatRequest
     ) -> list[dict[str, Any]]:
+        logger.info(
+            f"EXCLUDE TOOLS SETTING: {self.settings.tool_emulation_exclude_tools!r}"
+        )
+        exclude_list = [
+            t.strip()
+            for t in self.settings.tool_emulation_exclude_tools.split(",")
+            if t.strip()
+        ]
+        if exclude_list:
+            tools = [t for t in tools if t.get("name") not in exclude_list]
+
         if tool_choice == "none":
             return []
 
@@ -140,7 +160,7 @@ class ToolEmulationPipeline:
                 content = getattr(last_msg, "content", "")
                 if isinstance(content, str):
                     query_terms = set(re.findall(r"\w+", content.lower()))
-        
+
         def score_tool(t: dict[str, Any]) -> int:
             text = f"{t.get('name', '')} {t.get('description', '')}".lower()
             params = t.get("parameters", {}).get("properties", {})
@@ -252,7 +272,7 @@ class ToolEmulationPipeline:
         return final_prompt
 
     def parse_response(
-        self, text: str, tools: list[dict[str, Any]]
+        self, text: str, tools: list[dict[str, Any]], workspace_root: str | None = None
     ) -> list[ToolCall] | None:
         if not text:
             return None
@@ -309,6 +329,64 @@ class ToolEmulationPipeline:
             if not name:
                 continue
 
+            args = item.get("arguments", "{}")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
+
+            if workspace_root:
+                try:
+                    # Normalize and validate filePath only for known file tools
+                    if (
+                        name in FILE_TOOLS_WITH_FILEPATH
+                        and "filePath" in args
+                        and isinstance(args["filePath"], str)
+                    ):
+                        fp = args["filePath"]
+                        workspace_path = Path(workspace_root).resolve()
+                        target_path = Path(fp)
+                        if not target_path.is_absolute():
+                            target_path = workspace_path / target_path
+                        resolved_path = target_path.resolve()
+
+                        if not (
+                            workspace_path in resolved_path.parents
+                            or resolved_path == workspace_path
+                        ):
+                            logger.warning(f"Rejected path outside workspace: {fp}")
+                            continue
+
+                        args["filePath"] = str(resolved_path)
+
+                    # Normalize and validate path only for known file tools
+                    if (
+                        name in FILE_TOOLS_WITH_PATH
+                        and "path" in args
+                        and isinstance(args["path"], str)
+                    ):
+                        p = args["path"]
+                        workspace_path = Path(workspace_root).resolve()
+                        target_path = Path(p)
+                        if not target_path.is_absolute():
+                            target_path = workspace_path / target_path
+                        resolved_path = target_path.resolve()
+
+                        if not (
+                            workspace_path in resolved_path.parents
+                            or resolved_path == workspace_path
+                        ):
+                            logger.warning(f"Rejected path outside workspace: {p}")
+                            continue
+
+                        args["path"] = str(resolved_path)
+                except Exception as e:
+                    logger.warning(f"Error normalizing/validating path: {e}")
+                    continue
+
             if self.settings.tool_emulation_validate_schema:
                 if name not in tool_map:
                     continue
@@ -316,19 +394,11 @@ class ToolEmulationPipeline:
                 params_schema = tdef.get("parameters", {})
                 req = params_schema.get("required", [])
                 props = params_schema.get("properties", {})
-                
-                args = item.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        continue
-                if not isinstance(args, dict):
-                    continue
+
                 missing = [r for r in req if r not in args]
                 if missing:
                     continue
-                
+
                 # Basic type and enum validation
                 invalid = False
                 for k, v in args.items():
@@ -337,7 +407,9 @@ class ToolEmulationPipeline:
                         t = p_schema.get("type")
                         if t == "string" and not isinstance(v, str):
                             invalid = True
-                        elif t in ("integer", "number") and not isinstance(v, (int, float)):
+                        elif t in ("integer", "number") and not isinstance(
+                            v, (int, float)
+                        ):
                             invalid = True
                         elif t == "boolean" and not isinstance(v, bool):
                             invalid = True
@@ -345,17 +417,15 @@ class ToolEmulationPipeline:
                             invalid = True
                         elif t == "object" and not isinstance(v, dict):
                             invalid = True
-                            
+
                         enum_vals = p_schema.get("enum")
                         if enum_vals and v not in enum_vals:
                             invalid = True
-                
+
                 if invalid:
                     continue
 
-            args_str = item.get("arguments", "{}")
-            if isinstance(args_str, dict):
-                args_str = json.dumps(args_str, ensure_ascii=False)
+            args_str = json.dumps(args, ensure_ascii=False)
 
             tool_calls.append(
                 ToolCall(
@@ -436,12 +506,15 @@ class ToolEmulationPipeline:
         tone: str,
         normalized_tools: list[dict[str, Any]],
         images: list[Any] | None = None,
+        workspace_root: str | None = None,
     ) -> Tuple[list[ToolCall] | None, str]:
         """
         Executes the LLM call with retry loop for parsing and fixing malformed tool blocks.
         """
         text = await client.chat(prompt, additional_context, session, tone, images)
-        calls = self.parse_response(text, normalized_tools)
+        calls = self.parse_response(
+            text, normalized_tools, workspace_root=workspace_root
+        )
 
         attempt = 0
         max_retries = (
@@ -458,6 +531,8 @@ class ToolEmulationPipeline:
 
             attempt += 1
             text = await client.chat(retry_prompt, additional_context, session, tone)
-            calls = self.parse_response(text, normalized_tools)
+            calls = self.parse_response(
+                text, normalized_tools, workspace_root=workspace_root
+            )
 
         return calls, text

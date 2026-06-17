@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     tool_emulation_enabled: bool = Field(
         default=True, alias="M365_TOOL_EMULATION_ENABLED"
     )
+    tool_emulation_exclude_tools: str = Field(
+        default="", alias="M365_TOOL_EMULATION_EXCLUDE_TOOLS"
+    )
     tool_emulation_emulate_when_capability_unknown: bool = Field(
         default=False, alias="M365_TOOL_EMULATION_UNKNOWN"
     )

@@ -123,6 +123,7 @@ def _summarize_tool_calls(tool_calls: Any) -> str:
 def translate_openai_request(request: OpenAIChatRequest) -> TranslatedRequest:
     system_lines: list[str] = []
     transcript_lines: list[str] = []
+    tool_result_lines: list[str] = []
     last_user_text: str | None = None
 
     for message in request.messages:
@@ -141,7 +142,7 @@ def translate_openai_request(request: OpenAIChatRequest) -> TranslatedRequest:
                 transcript_lines.append(f"Assistant: {text}")
         elif message.role == "tool":
             ref = message.name or message.tool_call_id or "tool"
-            transcript_lines.append(f"Tool result [{ref}]: {text}")
+            tool_result_lines.append(f"Tool result [{ref}]: {text}")
         else:  # user
             if text:
                 transcript_lines.append(f"User: {text}")
@@ -171,6 +172,9 @@ def translate_openai_request(request: OpenAIChatRequest) -> TranslatedRequest:
     transcript_text = _join_lines(transcript_lines)
     if transcript_text:
         additional_context.append(f"Prior conversation transcript:\n{transcript_text}")
+    tool_results_text = _join_lines(tool_result_lines)
+    if tool_results_text:
+        additional_context.append(f"Tool results:\n{tool_results_text}")
     return TranslatedRequest(prompt=prompt, additional_context=additional_context)
 
 
@@ -254,6 +258,7 @@ def translate_anthropic_request(
     if base_system:
         system_lines.append(base_system)
     transcript_lines: list[str] = []
+    tool_result_lines: list[str] = []
     last_user_text: str | None = None
 
     for message in request.messages:
@@ -285,7 +290,7 @@ def translate_anthropic_request(
                 transcript_lines.append(f"Assistant (tool call): {part.name}({args})")
             elif part.type == "tool_result":
                 ref = part.tool_use_id or "tool"
-                transcript_lines.append(
+                tool_result_lines.append(
                     f"Tool result [{ref}]: {_tool_result_text(part.content)}"
                 )
         if role == "user" and user_text_parts:
@@ -311,4 +316,7 @@ def translate_anthropic_request(
     transcript_text = _join_lines(transcript_lines)
     if transcript_text:
         additional_context.append(f"Prior conversation transcript:\n{transcript_text}")
+    tool_results_text = _join_lines(tool_result_lines)
+    if tool_results_text:
+        additional_context.append(f"Tool results:\n{tool_results_text}")
     return TranslatedRequest(prompt=prompt, additional_context=additional_context)

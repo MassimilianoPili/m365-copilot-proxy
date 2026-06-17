@@ -27,3 +27,6 @@ dist/
 # Log files
 *.log
 logs/
+
+# Test temp workspaces
+temp/

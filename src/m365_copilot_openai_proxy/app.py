@@ -42,6 +42,7 @@ from .translator import (
 )
 from .tool_middleware.tool_emulation import ToolEmulationPipeline
 
+
 def _debug_dump(label: str, content: str) -> None:
     if not os.environ.get("M365_DEBUG"):
         return
@@ -200,6 +201,7 @@ def create_app(
             await _debug_raw(raw_request)
             pipeline = ToolEmulationPipeline(settings)
 
+            original_stream = request.stream
             is_emulating = pipeline.is_emulation_active(request)
             request, tools_prompt, normalized_tools = pipeline.preflight(request)
 
@@ -239,7 +241,14 @@ def create_app(
 
             if is_emulating:
                 calls, text = await pipeline.execute_upstream(
-                    client, prompt, ctx, session, tone, normalized_tools, images=images
+                    client,
+                    prompt,
+                    ctx,
+                    session,
+                    tone,
+                    normalized_tools,
+                    images=images,
+                    workspace_root=_project_hint(request.messages) or os.getcwd(),
                 )
             else:
                 calls, text = (
@@ -252,6 +261,12 @@ def create_app(
         except SubstrateCopilotError as exc:
             print(f"[502] substrate error: {exc}")
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        if original_stream:
+            return StreamingResponse(
+                _openai_emulated_stream(settings.model_alias, calls, text),
+                media_type="text/event-stream",
+            )
 
         if calls:
             return JSONResponse(
@@ -386,6 +401,7 @@ def create_app(
                 tool_choice=request.tool_choice,
             )
             dummy_req, tools_prompt, normalized_tools = pipeline.preflight(dummy_req)
+            original_stream = getattr(request, "stream", False)
             if is_emulating and pipeline.settings.tool_emulation_force_non_streaming:
                 request.stream = False
 
@@ -416,7 +432,14 @@ def create_app(
 
             if is_emulating:
                 calls, text = await pipeline.execute_upstream(
-                    client, prompt, ctx, session, tone, normalized_tools, images=images
+                    client,
+                    prompt,
+                    ctx,
+                    session,
+                    tone,
+                    normalized_tools,
+                    images=images,
+                    workspace_root=_project_hint(request.messages) or os.getcwd(),
                 )
             else:
                 calls, text = (
@@ -429,6 +452,12 @@ def create_app(
         except SubstrateCopilotError as exc:
             print(f"[502] substrate error: {exc}")
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        if original_stream:
+            return StreamingResponse(
+                _anthropic_emulated_stream(settings.model_alias, calls, text),
+                media_type="text/event-stream",
+            )
 
         if calls:
             content = [
@@ -505,9 +534,9 @@ def _project_hint(messages: list) -> str:
     )
     mm = _CWD_LABEL_RE.search(blob)
     if mm:
-        return mm.group(1).rstrip("\\/").lower()
+        return mm.group(1).rstrip("\\/")
     mm = _ANY_PATH_RE.search(blob)
-    return mm.group(1).rstrip("\\/").lower() if mm else ""
+    return mm.group(1).rstrip("\\/") if mm else ""
 
 
 # VS Code injects these identical wrapper turns at the head of EVERY chat in a workspace; keying
@@ -539,7 +568,7 @@ def _conversation_key(messages: list) -> str:
     if not first_user and not hint:
         return "default"
     digest = hashlib.sha1(
-        f"{_SESSION_SALT}:{hint}:{first_user}".encode("utf-8", "ignore")
+        f"{_SESSION_SALT}:{hint.lower()}:{first_user}".encode("utf-8", "ignore")
     ).hexdigest()
     return digest[:16]
 
@@ -613,10 +642,16 @@ def _trim_history(ctx: list[str], session: PersistentSession | None) -> list[str
     """On continued turns of a persistent session, drop the re-sent prior transcript: substrate
     keeps the thread under the same conversation_id, so resending it just bloats the prompt and
     buries the current message. The first turn (turn_count == 0) still seeds full context.
-    System-instruction blocks are kept (they carry the client's standing directives)."""
+    System-instruction blocks are kept (they carry the client's standing directives).
+    Tool results are ALWAYS kept - the model needs them to answer the user's request."""
     if session is None or session.turn_count == 0:
         return ctx
-    return [c for c in ctx if not c.startswith("Prior conversation transcript:")]
+    return [
+        c
+        for c in ctx
+        if not c.startswith("Prior conversation transcript:")
+        or c.startswith("Tool results:")
+    ]
 
 
 async def _debug_raw(raw_request: Request) -> None:
@@ -831,4 +866,193 @@ async def _anthropic_stream(
             "usage": {"output_tokens": 0},
         },
     )
+    yield sse("message_stop", {"type": "message_stop"})
+
+
+async def _openai_emulated_stream(
+    model_alias: str,
+    calls: list | None,
+    text: str,
+) -> AsyncIterator[str]:
+    completion_id = f"chatcmpl_{uuid.uuid4().hex}"
+    created = int(time.time())
+
+    if calls:
+        tool_calls_payload = [
+            {
+                "index": i,
+                "id": c.get("id")
+                if isinstance(c, dict)
+                else getattr(c, "id", f"call_{i}"),
+                "type": "function",
+                "function": {
+                    "name": c.get("function", {}).get("name")
+                    if isinstance(c, dict)
+                    else c.function.name,
+                    "arguments": c.get("function", {}).get("arguments")
+                    if isinstance(c, dict)
+                    else c.function.arguments,
+                },
+            }
+            for i, c in enumerate(calls)
+        ]
+        first = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_alias,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": tool_calls_payload,
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield f"data: {json.dumps(first)}\n\n"
+        final = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_alias,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        }
+        yield f"data: {json.dumps(final)}\n\n"
+    else:
+        first = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_alias,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": text},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield f"data: {json.dumps(first)}\n\n"
+        final = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_alias,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        yield f"data: {json.dumps(final)}\n\n"
+
+    yield "data: [DONE]\n\n"
+
+
+async def _anthropic_emulated_stream(
+    model_alias: str,
+    calls: list | None,
+    text: str,
+) -> AsyncIterator[str]:
+    msg_id = f"msg_{uuid.uuid4().hex}"
+
+    def sse(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    yield sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model_alias,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        },
+    )
+
+    if calls:
+        for i, c in enumerate(calls):
+            name = (
+                c.get("function", {}).get("name")
+                if isinstance(c, dict)
+                else c.function.name
+            )
+            args = (
+                c.get("function", {}).get("arguments")
+                if isinstance(c, dict)
+                else c.function.arguments
+            )
+            cid = c.get("id") if isinstance(c, dict) else getattr(c, "id", f"call_{i}")
+            try:
+                args_obj = json.loads(args or "{}") if isinstance(args, str) else args
+            except Exception:
+                args_obj = {}
+
+            yield sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": i,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": cid,
+                        "name": name,
+                        "input": {},
+                    },
+                },
+            )
+            yield sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": i,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(args_obj, ensure_ascii=False)
+                        if isinstance(args_obj, dict)
+                        else str(args_obj),
+                    },
+                },
+            )
+            yield sse("content_block_stop", {"type": "content_block_stop", "index": i})
+        yield sse(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                "usage": {"output_tokens": 0},
+            },
+        )
+    else:
+        yield sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+        yield sse(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            },
+        )
+        yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+        yield sse(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 0},
+            },
+        )
+
     yield sse("message_stop", {"type": "message_stop"})
