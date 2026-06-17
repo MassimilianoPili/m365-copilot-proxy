@@ -196,16 +196,44 @@ def _needs_substrate_token(token: str | None) -> bool:
         return True
 
 
+async def _cdp_close_browser(port: int) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=1) as client:
+            resp = await client.get(f"http://localhost:{port}/json/version")
+            data = resp.json()
+        ws_url = data.get("webSocketDebuggerUrl")
+        if ws_url:
+            async with websockets.connect(ws_url) as ws:
+                await ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
+                try:
+                    await asyncio.wait_for(ws.recv(), timeout=1)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _close_debug_browser(port: int) -> None:
+    if sys.platform.startswith("linux"):
+        try:
+            asyncio.run(_cdp_close_browser(port))
+            print("Successfully closed debug browser (Linux side).")
+        except Exception as exc:
+            print(f"Note: Could not close debug browser: {exc}")
+
+
 def _startup_capture_loop(cdp_port: int, timeout_seconds: int) -> None:
     print("Waiting for the debug Edge M365 tab...")
     _wait_for_m365_page(cdp_port, min(timeout_seconds, 30))
     print("Trying to refresh Substrate token from the debug Edge tab...")
     if _try_auto_refresh(cdp_port):
+        _close_debug_browser(cdp_port)
         return
     print("Waiting for a Substrate token from the debug Edge M365 Copilot tab...")
     print("If needed: press F5 in Copilot, click the message box, and type one character.")
     if _capture_token_to_env(cdp_port, timeout_seconds):
         print(".env updated with Substrate token.")
+        _close_debug_browser(cdp_port)
     else:
         print("Startup token capture timed out. Manual set-token is still available.")
 
@@ -626,6 +654,7 @@ def capture_token_command(args: argparse.Namespace) -> None:
         return
     _write_token(token)
     print(".env updated with Substrate token.")
+    _close_debug_browser(args.cdp_port)
 
 
 _CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"

@@ -318,6 +318,38 @@ def test_cli_linux_snap_profile_dir_uses_non_hidden_home(monkeypatch, tmp_path) 
     assert profile_dir == tmp_path / "m365-copilot-openai-proxy-browser-profile"
 
 
+def test_cli_linux_close_debug_browser_calls_cdp(monkeypatch) -> None:
+    from m365_copilot_openai_proxy.cli import _close_debug_browser
+
+    called_port = None
+
+    async def fake_cdp_close(port: int) -> None:
+        nonlocal called_port
+        called_port = port
+
+    monkeypatch.setattr("m365_copilot_openai_proxy.cli.sys.platform", "linux")
+    monkeypatch.setattr("m365_copilot_openai_proxy.cli._cdp_close_browser", fake_cdp_close)
+
+    _close_debug_browser(1234)
+    assert called_port == 1234
+
+
+def test_cli_non_linux_does_not_close_debug_browser(monkeypatch) -> None:
+    from m365_copilot_openai_proxy.cli import _close_debug_browser
+
+    called = False
+
+    async def fake_cdp_close(port: int) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("m365_copilot_openai_proxy.cli.sys.platform", "win32")
+    monkeypatch.setattr("m365_copilot_openai_proxy.cli._cdp_close_browser", fake_cdp_close)
+
+    _close_debug_browser(1234)
+    assert not called
+
+
 def test_openai_chat_completion_translates_history() -> None:
     fake = FakeCopilotClient()
     client = build_client(fake)
