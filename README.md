@@ -36,9 +36,9 @@ The server starts at:
 http://127.0.0.1:8000
 ```
 
-On first run, the proxy opens a dedicated Edge window. Sign in to M365 Copilot there once. The proxy will capture the required Substrate token and write it to `.env`.
+On first run, the proxy opens a dedicated Browser window. Sign in to M365 Copilot there once. The proxy will capture the required Substrate token and write it to `.env`.
 
-The dedicated Edge profile is stored at:
+The dedicated browser profile is stored at:
 
 ```text
 %USERPROFILE%\.m365-copilot-openai-proxy\edge-profile
@@ -259,7 +259,7 @@ m365-opus:persist
 
 ## Token Refresh
 
-M365 Copilot browser tokens usually expire in about 1 hour. The proxy refreshes them from the dedicated signed-in Edge window.
+M365 Copilot browser tokens usually expire in about 1 hour. The proxy refreshes them from the dedicated signed-in browser window.
 
 Auto-refresh is on by default:
 
@@ -286,7 +286,7 @@ uv run copilot-openai-proxy set-token
 
 Then paste a fresh Substrate WebSocket URL:
 
-1. Open the signed-in M365 Copilot Edge window.
+1. Open the signed-in M365 Copilot browser window.
 2. Open DevTools (`F12`) -> **Network** tab.
 3. Filter by `substrate`.
 4. Click the WebSocket entry.
@@ -423,13 +423,13 @@ Most users only need `.env` after the proxy captures a token.
 | `M365_SESSION_SALT` | random per process | Salt for the auto conversation fingerprint. Set it to keep keys stable across restarts. |
 | `M365_RECV_TIMEOUT` | `90` | Seconds to wait for a substrate frame before giving up. |
 | `M365_OPEN_TIMEOUT` | `30` | WebSocket handshake timeout (seconds). |
-| `M365_EDGE_PATH` | Edge default path | Edge executable used for the debug token-capture window. |
+| `M365_EDGE_PATH` | Browser default path | Browser executable used for the debug token-capture window. |
 | `M365_DEBUG` | unset | When set, writes request/response diagnostics to `debug.log`. |
 
 ## Limitations
 
 - This is an unofficial local proxy over the browser-facing M365 Copilot API, reverse-engineered from the web client. The captured protocol (in `substrate.json`) can break without notice.
-- Token refresh depends on a signed-in Edge profile.
+- Token refresh depends on a signed-in browser profile.
 - Tool calling is a best-effort prompt shim, not native function calling — it can fail or misformat.
 - Token usage numbers are placeholders.
 - System prompts and prior conversation history are translated into plain text context.
@@ -441,7 +441,7 @@ Apache License 2.0. See [LICENSE](LICENSE).
 
 ## Token Automation Details
 
-See [docs/TOKEN_REFRESH.md](docs/TOKEN_REFRESH.md) for the deeper Edge CDP refresh notes and alternatives.
+See [docs/TOKEN_REFRESH.md](docs/TOKEN_REFRESH.md) for the deeper browser CDP refresh notes and alternatives.
 
 ## Credits
 
