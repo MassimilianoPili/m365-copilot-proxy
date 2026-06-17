@@ -42,3 +42,6 @@ packages = ["src/m365_copilot_openai_proxy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "real_model: opencode test with real model (requires network access and valid credentials)"
+]

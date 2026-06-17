@@ -13,9 +13,9 @@ import pytest
 
 # Not tested on windows
 
-TARGET_MODEL = "m365-copilot-proxy/m365-gpt-reasoning"
-TARGET_PROMPT = "Read the file on test/sample.txt. Reply with just the content of the file, no explanation needed. If cannot read the file, reply with 'CANNOT_READ_FILE'."
-TARGET_FILE = "test/sample.txt"
+TARGET_MODEL = "m365-copilot-proxy/m365-gpt-think"
+TARGET_PROMPT = "Read the file on tests/sample.txt. Reply with just the content of the file, no explanation needed. If cannot read the file, reply with 'CANNOT_READ_FILE'."
+TARGET_FILE = "tests/sample.txt"
 TARGET_CONTENT = "The content of this file is used to verify."
 _BEGIN = "<<<TOOL_CALLS>>>"
 
@@ -72,8 +72,8 @@ def _write_opencode_config(home_dir: Path, base_url: str) -> None:
         "apiKey": "dummy"
       },
       "models": {
-        "m365-gpt-reasoning": {
-          "name": "m365-gpt-reasoning"
+        "m365-gpt-think": {
+          "name": "m365-gpt-think"
         }
       }
     }
@@ -246,11 +246,9 @@ def test_opencode_tool_calls_runtime_bridge_real_model(tmp_path: Path) -> None:
     assert TARGET_CONTENT in output_blob
 
     assert "step=1 loop" in proc.stderr
+    assert "modelID=m365-gpt-think" in proc.stderr
 
-    assert "modelID=m365-gpt-reasoning" in proc.stderr
-
-    # Retrieve the model's text response from standard JSON events of the successful run
-    import re
+    # Retrieve the model's text response from JSON events
     response = "".join(
         e.get("part", {}).get("text", "")
         for e in events
@@ -261,21 +259,15 @@ def test_opencode_tool_calls_runtime_bridge_real_model(tmp_path: Path) -> None:
 
     print(f"\nCaptured Model Response:\n{response}\n")
 
-    # Compare response and expected content (TARGET_CONTENT)
-    response_clean = response.strip()
-    target_clean = TARGET_CONTENT.strip()
+    # Non stdout/print (usually for silent test runs)
+    response_log_path = Path("./logs/opencode_response.log")
+    response_log_path.parent.mkdir(parents=True, exist_ok=True)
+    response_log_path.write_text(response, encoding="utf-8")
 
-    is_match = response_clean == target_clean
-    if not is_match:
-        # Check if the target is wrapped in a markdown code block inside the response
-        code_blocks = re.findall(r"```(?:[a-zA-Z0-9_-]+)?\s*\n(.*?)\n\s*```", response, re.DOTALL)
-        for block in code_blocks:
-            if block.strip() == target_clean:
-                is_match = True
-                break
-
-    if not is_match:
-        # Fallback to substring match
-        is_match = target_clean in response_clean
-
-    assert is_match, f"Model response does not match the file content.\nExpected: {repr(TARGET_CONTENT)}\nGot: {repr(response)}"
+    response_clean = response.rstrip('\n')
+    expected_clean = TARGET_CONTENT.rstrip('\n')
+    assert response_clean == expected_clean, (
+        f"Model response does not match file content exactly.\n"
+        f"Expected: {repr(expected_clean)}\n"
+        f"Got:      {repr(response_clean)}"
+    )
