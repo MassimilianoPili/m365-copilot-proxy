@@ -52,6 +52,7 @@ _DEFAULT_SETTINGS = {
     "ws_reuse": False,           # keep one WebSocket alive per session (experimental)
     "passthrough_claude": True,  # forward non-m365 models straight to the real Anthropic API
     "anthropic_key": "",         # optional API-key override for passthrough (empty -> OAuth file)
+    "hide_on_token_success": True, # automatically close/hide debug browser on token capture
 }
 
 
@@ -112,6 +113,7 @@ class ProxyController:
         self._stop_refresh = threading.Event()
         self._lock = threading.Lock()
         self._running = False
+        self.browser_running = False
 
     @property
     def base_url(self) -> str:
@@ -143,6 +145,7 @@ class ProxyController:
             os.environ["M365_PERSIST_DEFAULT"] = "true" if s.get("persist_default", True) else "false"
             os.environ["M365_WS_REUSE"] = "true" if s.get("ws_reuse", False) else "false"
             os.environ["M365_ANTHROPIC_PASSTHROUGH"] = "true" if s.get("passthrough_claude", False) else "false"
+            os.environ["M365_HIDE_ON_TOKEN_SUCCESS"] = "true" if s.get("hide_on_token_success", True) else "false"
             override_key = (s.get("anthropic_key") or "").strip()
             if override_key:
                 os.environ["M365_ANTHROPIC_KEY"] = override_key
@@ -400,6 +403,18 @@ def run_tray() -> None:
     settings = load_settings()
     controller = ProxyController(settings)
 
+    def check_browser_status():
+        from .cli import _edge_debug_tabs
+        while True:
+            try:
+                tabs = _edge_debug_tabs(controller.cdp_port)
+                controller.browser_running = (tabs is not None)
+            except Exception:
+                controller.browser_running = False
+            time.sleep(1.5)
+
+    threading.Thread(target=check_browser_status, daemon=True).start()
+
     app = ctk.CTk()
     app.title("M365 Copilot Proxy")
     app.resizable(False, False)
@@ -465,9 +480,38 @@ def run_tray() -> None:
     reload_btn = ctk.CTkButton(t_status, text="↻ Reload (reconnect)", height=34, corner_radius=17,
                                font=ctk.CTkFont(size=12, weight="bold"), fg_color=CARD, hover_color="#2A2A33")
 
+    def toggle_browser():
+        from .cli import _launch_debug_edge
+        browser_btn.configure(state="disabled")
+        if controller.browser_running:
+            def work():
+                try:
+                    import asyncio
+                    from .cli import _cdp_close_browser
+                    asyncio.run(_cdp_close_browser(controller.cdp_port))
+                except Exception:
+                    pass
+                finally:
+                    app.after(0, lambda: browser_btn.configure(state="normal"))
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            def work():
+                try:
+                    _launch_debug_edge(controller.cdp_port)
+                except Exception:
+                    pass
+                finally:
+                    app.after(0, lambda: browser_btn.configure(state="normal"))
+            threading.Thread(target=work, daemon=True).start()
+
+    browser_btn = ctk.CTkButton(t_status, text="Show Browser", height=34, corner_radius=17,
+                                font=ctk.CTkFont(size=12, weight="bold"), fg_color=CARD, hover_color="#2A2A33",
+                                command=toggle_browser)
+
     toggle_btn = ctk.CTkButton(t_status, text="Connect", height=46, corner_radius=23,
                                font=ctk.CTkFont(size=15, weight="bold"), fg_color=ACCENT, hover_color=ACCENT_HOVER)
     toggle_btn.pack(padx=18, pady=(22, 8), fill="x", side="bottom")
+    browser_btn.pack(padx=18, pady=(0, 4), fill="x", side="bottom", before=toggle_btn)
 
     # ---- Logs tab ----
     log_box = ctk.CTkTextbox(t_logs, fg_color="#101014", text_color="#C9C9D0",
@@ -505,6 +549,7 @@ def run_tray() -> None:
     _switch(sform, "auto_refresh", "Auto-refresh token")
     _switch(sform, "persist_default", "Reuse one conversation per chat")
     _switch(sform, "ws_reuse", "Keep WebSocket alive (experimental)")
+    _switch(sform, "hide_on_token_success", "Hide browser on token success")
 
     def reconnect_async():
         if controller.running:
@@ -540,7 +585,7 @@ def run_tray() -> None:
         except ValueError:
             pass
         for key in ("auto_connect", "temporary_chat", "work_grounding", "configure_clients",
-                    "launch_edge", "auto_refresh", "persist_default", "ws_reuse"):
+                    "launch_edge", "auto_refresh", "persist_default", "ws_reuse", "hide_on_token_success"):
             settings[key] = bool(vars_[key].get())  # type: ignore[attr-defined]
         save_settings(settings)
         if controller.running:
@@ -664,8 +709,10 @@ def run_tray() -> None:
             text="↻ Reload VS Code (Ctrl+Shift+P → Reload Window) to load the M365 model"
             if on and settings.get("configure_clients", True) else ""
         )
+        if browser_btn.cget("state") == "normal":
+            browser_btn.configure(text="Hide Browser" if controller.browser_running else "Show Browser")
         if on:
-            reload_btn.pack(padx=18, pady=(0, 4), fill="x", side="bottom", before=toggle_btn)
+            reload_btn.pack(padx=18, pady=(0, 4), fill="x", side="bottom", before=browser_btn)
         else:
             reload_btn.pack_forget()
         toggle_btn.configure(text="Disconnect" if on else "Connect",

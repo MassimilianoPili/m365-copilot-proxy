@@ -334,7 +334,7 @@ def test_cli_linux_close_debug_browser_calls_cdp(monkeypatch) -> None:
     assert called_port == 1234
 
 
-def test_cli_non_linux_does_not_close_debug_browser(monkeypatch) -> None:
+def test_cli_close_debug_browser_honors_setting(monkeypatch) -> None:
     from m365_copilot_openai_proxy.cli import _close_debug_browser
 
     called = False
@@ -343,8 +343,8 @@ def test_cli_non_linux_does_not_close_debug_browser(monkeypatch) -> None:
         nonlocal called
         called = True
 
-    monkeypatch.setattr("m365_copilot_openai_proxy.cli.sys.platform", "win32")
     monkeypatch.setattr("m365_copilot_openai_proxy.cli._cdp_close_browser", fake_cdp_close)
+    monkeypatch.setenv("M365_HIDE_ON_TOKEN_SUCCESS", "false")
 
     _close_debug_browser(1234)
     assert not called

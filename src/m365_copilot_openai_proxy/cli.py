@@ -214,12 +214,22 @@ async def _cdp_close_browser(port: int) -> None:
 
 
 def _close_debug_browser(port: int) -> None:
-    if sys.platform.startswith("linux"):
-        try:
-            asyncio.run(_cdp_close_browser(port))
-            print("Successfully closed debug browser (Linux side).")
-        except Exception as exc:
-            print(f"Note: Could not close debug browser: {exc}")
+    hide_val = os.environ.get("M365_HIDE_ON_TOKEN_SUCCESS")
+    if hide_val is None:
+        hide_val = _read_env_value("M365_HIDE_ON_TOKEN_SUCCESS")
+    if hide_val is None:
+        hide = True
+    else:
+        hide = hide_val.strip().lower() in ("1", "true", "yes", "on")
+
+    if not hide:
+        return
+
+    try:
+        asyncio.run(_cdp_close_browser(port))
+        print("Successfully closed debug browser on token success.")
+    except Exception as exc:
+        print(f"Note: Could not close debug browser: {exc}")
 
 
 def _startup_capture_loop(cdp_port: int, timeout_seconds: int) -> None:

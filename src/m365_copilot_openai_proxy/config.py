@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     # True -> keep one substrate WebSocket alive per persistent session (skips the per-turn
     # handshake). Default off until validated against substrate (see Workstream A).
     ws_reuse: bool = Field(default=False, alias="M365_WS_REUSE")
+    # True -> automatically close/hide the debug browser window when a token is successfully acquired.
+    hide_on_token_success: bool = Field(default=True, alias="M365_HIDE_ON_TOKEN_SUCCESS")
     # Path to the Edge executable used for the debug token-capture window.
     edge_path: str = Field(
         default=r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
