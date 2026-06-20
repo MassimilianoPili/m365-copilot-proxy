@@ -13,9 +13,9 @@ uv run copilot-openai-proxy set-token
 
 ## Option A — Playwright (recommended)
 
-Launch a hidden browser using the existing Edge user profile (already authenticated). Navigate to M365 Copilot, intercept the WebSocket connection, extract the token, update `.env`, restart the server.
+Launch a hidden browser using the existing browser user profile (already authenticated). Navigate to M365 Copilot, intercept the WebSocket connection, extract the token, update `.env`, restart the server.
 
-**Pros:** fully automatic, works even if Edge is not open  
+**Pros:** fully automatic, works even if the browser is not open  
 **Cons:** requires `playwright` + `playwright install msedge`, takes ~5s per refresh
 
 Implementation sketch:
@@ -47,24 +47,24 @@ Schedule with `schedule` or `apscheduler` every 50 minutes.
 
 ---
 
-## Option B — Edge remote debugging (CDP)
+## Option B — Browser remote debugging (CDP)
 
-Launch a dedicated Edge profile with the remote debugging flag, then connect to it via CDP.
+Launch a dedicated browser profile with the remote debugging flag, then connect to it via CDP.
 
 **Start the server:**
 ```powershell
 uv run copilot-openai-proxy serve
 ```
 
-`serve` opens the dedicated debug Edge window by default. Sign in to M365 Copilot in that window once.
+`serve` opens the dedicated debug browser window by default. Sign in to M365 Copilot in that window once.
 The profile is stored under
 `%USERPROFILE%\.m365-copilot-openai-proxy\edge-profile`, so later launches can reuse the sign-in.
 Then the server connects to `http://localhost:9222` and extracts the token from the Copilot tab.
 `uv run copilot-openai-proxy serve` starts an auto-refresh loop by default. It refreshes when the
 current JWT has less than 5 minutes left.
 If the current token is missing, expired, or not a Substrate token, `serve` first tries the same `r`-style
-refresh from the current debug Edge tab. If no Substrate token is available yet, it starts a one-shot
-startup capture listener. Generate a new WebSocket by pressing `F5` in the debug Edge Copilot tab, clicking
+refresh from the current debug browser tab. If no Substrate token is available yet, it starts a one-shot
+startup capture listener. Generate a new WebSocket by pressing `F5` in the debug browser Copilot tab, clicking
 the message box, and typing one character. The message does not need to be sent.
 
 Useful serve flags:
@@ -75,8 +75,8 @@ uv run copilot-openai-proxy serve --no-capture-on-start
 uv run copilot-openai-proxy serve --no-auto-refresh
 ```
 
-**Pros:** lightweight, uses `websockets` (already installed), works even if normal Edge is already open  
-**Cons:** requires a separate Edge profile; less reliable if the Copilot tab is closed
+**Pros:** lightweight, uses `websockets` (already installed), works even if the normal browser is already open  
+**Cons:** requires a separate browser profile; less reliable if the Copilot tab is closed
 
 ---
 

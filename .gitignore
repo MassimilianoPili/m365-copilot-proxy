@@ -23,3 +23,10 @@ last_request.json
 build/
 dist/
 *.spec
+
+# Log files
+*.log
+logs/
+
+# Test temp workspaces
+temp/
